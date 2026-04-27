@@ -1,0 +1,526 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+model User {
+  id                 String                   @id @default(cuid())
+  azureOid           String                   @unique
+  email              String?                  @unique
+  fullName           String?
+  createdAt          DateTime                 @default(now())
+  updatedAt          DateTime                 @updatedAt
+  integrations       IntegrationConnection[]
+  emailMessages      EmailMessage[]
+  jobs               ProcessingJob[]
+  graphSubscriptions EmailGraphSubscription[]
+  memberships        WorkspaceMembership[]
+  invoices           InvoiceRecord[]
+  auditEvents        AuditEvent[]
+  documents          DocumentRecord[]
+  approvalsCreated   ApprovalRequest[]        @relation("ApprovalCreatedBy")
+  approvalsDecided   ApprovalRequest[]        @relation("ApprovalDecidedBy")
+}
+
+model Workspace {
+  id                      String                   @id @default(cuid())
+  name                    String
+  aadTenantId             String                   @unique
+  automationSettings      Json?
+  createdAt               DateTime                 @default(now())
+  updatedAt               DateTime                 @updatedAt
+  memberships             WorkspaceMembership[]
+  integrations            IntegrationConnection[]
+  emailMessages           EmailMessage[]
+  jobs                    ProcessingJob[]
+  graphSubscriptions      EmailGraphSubscription[]
+  invoices                InvoiceRecord[]
+  auditEvents             AuditEvent[]
+  documentTypes           DocumentType[]
+  documents               DocumentRecord[]
+  approvals               ApprovalRequest[]
+  businessCentralMappings BusinessCentralMapping[]
+  documentLinks           DocumentLink[]
+  matchRules              MatchRule[]
+  bcTargets               BcTarget[]
+  bcFields                BcField[]
+  bcMappingProfiles       BcMappingProfile[]
+  bcExtensionTargets      BcExtensionTarget[]
+  bcSyncEvents            BcSyncEvent[]
+  documentEmbeddings      DocumentEmbedding[]
+}
+
+model WorkspaceMembership {
+  id          String    @id @default(cuid())
+  userId      String
+  workspaceId String
+  role        String    @default("ADMIN")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace   Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, workspaceId])
+}
+
+model IntegrationConnection {
+  id                 String                   @id @default(cuid())
+  userId             String
+  workspaceId        String?
+  kind               String
+  displayName        String
+  status             String                   @default("DISCONNECTED")
+  configJson         Json?
+  lastSyncAt         DateTime?
+  createdAt          DateTime                 @default(now())
+  updatedAt          DateTime                 @updatedAt
+  user               User                     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace          Workspace?               @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  emailMessages      EmailMessage[]
+  graphSubscriptions EmailGraphSubscription[]
+
+  @@index([userId, kind])
+  @@index([workspaceId, kind])
+}
+
+model EmailGraphSubscription {
+  id                 String                @id @default(cuid())
+  userId             String
+  workspaceId        String?
+  integrationId      String
+  subscriptionId     String                @unique
+  clientState        String
+  resource           String
+  expirationDateTime DateTime
+  createdAt          DateTime              @default(now())
+  updatedAt          DateTime              @updatedAt
+  user               User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace          Workspace?            @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  integration        IntegrationConnection @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+
+  @@index([integrationId, expirationDateTime])
+}
+
+model EmailMessage {
+  id            String                @id @default(cuid())
+  userId        String
+  workspaceId   String?
+  integrationId String
+  externalId    String?
+  sender        String
+  subject       String
+  receivedAt    DateTime
+  rawPayload    Json
+  status        String                @default("RECEIVED")
+  createdAt     DateTime              @default(now())
+  updatedAt     DateTime              @updatedAt
+  user          User                  @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace     Workspace?            @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  integration   IntegrationConnection @relation(fields: [integrationId], references: [id], onDelete: Cascade)
+  jobs          ProcessingJob[]
+  invoices      InvoiceRecord[]
+  documents     DocumentRecord[]
+
+  @@index([userId, receivedAt])
+  @@index([workspaceId, receivedAt])
+  @@index([integrationId, receivedAt])
+}
+
+model DocumentType {
+  id          String @id @default(cuid())
+  workspaceId String
+
+  /**
+   * Clave estable para reglas y ERP mapping (ej: invoice, delivery_note, purchase_order).
+   */
+  key         String
+  displayName String
+  enabled     Boolean @default(true)
+
+  /**
+   * Plantilla de ruta por tipo (si null, se usa la del workspace).
+   */
+  sharePointPathTemplate   String?
+  requireApprovalBeforeErp Boolean @default(true)
+
+  /**
+   * Esquema de extracción configurable por tipo (campos deseados, hints).
+   */
+  aiExtractionSchema Json?
+
+  /**
+   * Políticas enterprise (configurables desde UI; JSON con defaults en aplicación).
+   * sharepointRouting: { pathTemplate?, description? }
+   * matchingPolicy: { enabled, relatedTypes: [{ targetKey, strategy?, weight? }] }
+   * approvalPolicy: { minConfidenceAutoPass, requireHumanBelowThreshold }
+   * validationPolicy: { requiredPaths: string[] }
+   * bcPolicy: { enabled, mappingProfileId?, syncMode: MANUAL | AFTER_APPROVAL | AUTO_IF_CONFIDENT, autoMinConfidence? }
+   */
+  sharepointRouting Json?
+  matchingPolicy    Json?
+  approvalPolicy    Json?
+  validationPolicy  Json?
+  bcPolicy          Json?
+  configVersion     Int     @default(1)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  workspace         Workspace                @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  documents         DocumentRecord[]
+  bcMappings        BusinessCentralMapping[]
+  matchRules        MatchRule[]
+  bcMappingProfiles BcMappingProfile[]
+
+  @@unique([workspaceId, key])
+  @@index([workspaceId, enabled])
+}
+
+model DocumentRecord {
+  id             String  @id @default(cuid())
+  userId         String
+  workspaceId    String?
+  emailMessageId String?
+
+  documentTypeId String?
+  documentType   DocumentType? @relation(fields: [documentTypeId], references: [id], onDelete: SetNull)
+
+  /**
+   * Datos del adjunto
+   */
+  fileName    String
+  contentType String?
+  sizeBytes   Int?
+  sha256      String?
+
+  status         String  @default("RECEIVED")
+  confidence     Float?
+  extractionJson Json?
+  lastError      String?
+
+  /**
+   * SharePoint
+   */
+  sharepointSiteId  String?
+  sharepointDriveId String?
+  sharepointItemId  String?
+  sharepointWebUrl  String?
+  sharepointPath    String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user         User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace    Workspace?    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  emailMessage EmailMessage? @relation(fields: [emailMessageId], references: [id], onDelete: Cascade)
+
+  approvalRequests ApprovalRequest[]
+  sourceLinks      DocumentLink[]    @relation("DocumentLinkSource")
+  targetLinks      DocumentLink[]    @relation("DocumentLinkTarget")
+  bcSyncEvents     BcSyncEvent[]
+  embeddingRow     DocumentEmbedding?
+
+  @@unique([workspaceId, sha256])
+  @@index([workspaceId, status, createdAt])
+  @@index([emailMessageId, createdAt])
+}
+
+/**
+ * Vector embedding for semantic document matching (pgvector).
+ * Inserts/updates con el vector suelen hacerse vía $executeRaw por el tipo Unsupported.
+ */
+model DocumentEmbedding {
+  id          String   @id @default(cuid())
+  workspaceId String
+  documentId  String   @unique
+  model       String
+  dims        Int
+  contentHash String
+  embedding   Unsupported("vector(1536)")
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  document  DocumentRecord @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId])
+}
+
+model ApprovalRequest {
+  id          String  @id @default(cuid())
+  workspaceId String?
+  documentId  String
+  status      String  @default("PENDING")
+
+  createdByUserId String?
+  decidedByUserId String?
+  decisionNote    String?
+
+  createdAt DateTime  @default(now())
+  decidedAt DateTime?
+
+  workspace Workspace?     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  document  DocumentRecord @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  createdByUser User? @relation("ApprovalCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
+  decidedByUser User? @relation("ApprovalDecidedBy", fields: [decidedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, status, createdAt])
+  @@index([documentId])
+}
+
+model BusinessCentralMapping {
+  id             String  @id @default(cuid())
+  workspaceId    String?
+  documentTypeId String
+
+  enabled Boolean @default(false)
+
+  /**
+   * Tabla destino (AL/BC). Ej: \"Purchase Header\", \"Purch. Inv. Header\", etc.
+   */
+  targetTable String
+
+  /**
+   * Mapeo de campos: { bcField: \"extraction.path\" | \"static\" | ... }
+   */
+  fieldMap Json
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  workspace    Workspace?   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  documentType DocumentType @relation(fields: [documentTypeId], references: [id], onDelete: Cascade)
+
+  @@unique([workspaceId, documentTypeId])
+  @@index([workspaceId, enabled])
+}
+
+model DocumentLink {
+  id               String   @id @default(cuid())
+  workspaceId      String
+  sourceDocumentId String
+  targetDocumentId String
+  linkType         String
+  score            Float    @default(0)
+  status           String   @default("PARTIAL_MATCH") // MATCHED | PARTIAL_MATCH | NEEDS_REVIEW | REJECTED
+  evidenceJson     Json?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  workspace      Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  sourceDocument DocumentRecord @relation("DocumentLinkSource", fields: [sourceDocumentId], references: [id], onDelete: Cascade)
+  targetDocument DocumentRecord @relation("DocumentLinkTarget", fields: [targetDocumentId], references: [id], onDelete: Cascade)
+
+  @@unique([sourceDocumentId, targetDocumentId, linkType])
+  @@index([workspaceId, status, createdAt])
+}
+
+model MatchRule {
+  id             String   @id @default(cuid())
+  workspaceId    String
+  documentTypeId String?
+  name           String
+  enabled        Boolean  @default(true)
+  strategy       String // exact | fuzzy | ai_semantic
+  weight         Float    @default(1)
+  configJson     Json
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  workspace    Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  documentType DocumentType? @relation(fields: [documentTypeId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, enabled, strategy])
+}
+
+model BcTarget {
+  id          String   @id @default(cuid())
+  workspaceId String
+  key         String
+  displayName String
+  category    String?
+  mode        String   @default("CURATED") // CURATED | EXTENSION
+  enabled     Boolean  @default(true)
+  schemaJson  Json?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace       Workspace          @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  fields          BcField[]
+  mappingProfiles BcMappingProfile[]
+  extensionConfig BcExtensionTarget?
+
+  @@unique([workspaceId, key])
+  @@index([workspaceId, enabled, mode])
+}
+
+model BcField {
+  id          String   @id @default(cuid())
+  workspaceId String
+  bcTargetId  String
+  key         String
+  displayName String
+  dataType    String
+  required    Boolean  @default(false)
+  allowWrite  Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  bcTarget  BcTarget  @relation(fields: [bcTargetId], references: [id], onDelete: Cascade)
+
+  @@unique([bcTargetId, key])
+  @@index([workspaceId, required])
+}
+
+model BcMappingProfile {
+  id             String   @id @default(cuid())
+  workspaceId    String
+  documentTypeId String
+  bcTargetId     String
+  name           String
+  enabled        Boolean  @default(true)
+  fieldMap       Json
+  transformMap   Json?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  workspace    Workspace     @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  documentType DocumentType  @relation(fields: [documentTypeId], references: [id], onDelete: Cascade)
+  bcTarget     BcTarget      @relation(fields: [bcTargetId], references: [id], onDelete: Cascade)
+  syncEvents   BcSyncEvent[]
+
+  @@index([workspaceId, enabled, updatedAt])
+}
+
+model BcExtensionTarget {
+  id             String   @id @default(cuid())
+  workspaceId    String
+  bcTargetId     String   @unique
+  approvalStatus String   @default("PENDING") // PENDING | APPROVED | REJECTED
+  sourceSchema   Json?
+  reviewerUserId String?
+  reviewNote     String?
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  bcTarget  BcTarget  @relation(fields: [bcTargetId], references: [id], onDelete: Cascade)
+}
+
+model BcSyncEvent {
+  id               String   @id @default(cuid())
+  workspaceId      String
+  documentId       String?
+  mappingProfileId String?
+  status           String   @default("PENDING") // PENDING | SENT | SYNCED | FAILED
+  attempt          Int      @default(0)
+  requestJson      Json?
+  responseJson     Json?
+  lastError        String?
+  externalRef      String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  workspace      Workspace         @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  document       DocumentRecord?   @relation(fields: [documentId], references: [id], onDelete: SetNull)
+  mappingProfile BcMappingProfile? @relation(fields: [mappingProfileId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, status, createdAt])
+}
+
+model InvoiceRecord {
+  id                String       @id @default(cuid())
+  userId            String
+  workspaceId       String?
+  emailMessageId    String
+  status            String       @default("PROCESSING")
+  vendorName        String?
+  vendorTaxId       String?
+  invoiceNumber     String?
+  invoiceDate       DateTime?
+  currency          String?
+  totalAmount       Decimal?     @db.Decimal(18, 4)
+  country           String?
+  area              String?
+  extractionJson    Json?
+  sharepointSiteId  String?
+  sharepointDriveId String?
+  sharepointItemId  String?
+  sharepointWebUrl  String?
+  sharepointPath    String?
+  fileName          String?
+  lastError         String?
+  createdAt         DateTime     @default(now())
+  updatedAt         DateTime     @updatedAt
+  user              User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace         Workspace?   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  emailMessage      EmailMessage @relation(fields: [emailMessageId], references: [id], onDelete: Cascade)
+
+  @@unique([emailMessageId])
+  @@index([workspaceId, createdAt])
+}
+
+model ProcessingJob {
+  id             String       @id @default(cuid())
+  userId         String
+  workspaceId    String?
+  emailMessageId String
+  queueKey       String
+  status         String       @default("PENDING")
+  attempts       Int          @default(0)
+  lastError      String?
+  payload        Json
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+  user           User         @relation(fields: [userId], references: [id], onDelete: Cascade)
+  workspace      Workspace?   @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  emailMessage   EmailMessage @relation(fields: [emailMessageId], references: [id], onDelete: Cascade)
+
+  @@index([userId, status, createdAt])
+  @@index([workspaceId, status, createdAt])
+}
+
+model AuditEvent {
+  id          String  @id @default(cuid())
+  userId      String?
+  workspaceId String?
+
+  /**
+   * Acción estable para análisis/alertas (ej: automation.settings.updated)
+   */
+  action String
+
+  /**
+   * Entidad afectada (ej: IntegrationConnection, InvoiceRecord, EmailGraphSubscription)
+   */
+  entityType String?
+  entityId   String?
+
+  /**
+   * Contexto adicional (no meter secretos).
+   */
+  metadata Json?
+
+  ip        String?
+  userAgent String?
+
+  createdAt DateTime @default(now())
+
+  user      User?      @relation(fields: [userId], references: [id], onDelete: SetNull)
+  workspace Workspace? @relation(fields: [workspaceId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, createdAt])
+  @@index([userId, createdAt])
+  @@index([action, createdAt])
+}
+

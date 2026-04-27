@@ -1,0 +1,45 @@
+# PostgreSQL 16 + pgvector para desarrollo local (Invoicely).
+#
+# Docker Compose lee variables desde el archivo .env en ESTA misma carpeta
+# (invoicely-back/.env) para sustituir ${POSTGRES_*} y ${POSTGRES_PUBLISH_PORT}.
+#
+# Uso:
+#   1. Definir en .env del backend las variables de la seccion "Base Docker" del docker/env.example
+#      (o copiar solo esas lineas). DATABASE_URL debe usar el mismo usuario, password, host/puerto y DB.
+#   2. docker compose up -d
+#   3. npx prisma migrate deploy
+#
+# Detalle: docker/README.md
+
+name: invoicely
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: invoicely-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-invoicely_dev_change_me}
+      POSTGRES_DB: ${POSTGRES_DB:-invoicely}
+    ports:
+      - "${POSTGRES_PUBLISH_PORT:-5432}:5432"
+    volumes:
+      - invoicely_pgdata:/var/lib/postgresql/data
+      - ./docker/postgres/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U \"$$POSTGRES_USER\" -d \"$$POSTGRES_DB\""]
+      interval: 5s
+      timeout: 5s
+      retries: 8
+      start_period: 15s
+    networks:
+      - invoicely
+
+networks:
+  invoicely:
+    name: invoicely_net
+
+volumes:
+  invoicely_pgdata:
+    name: invoicely_pgdata
