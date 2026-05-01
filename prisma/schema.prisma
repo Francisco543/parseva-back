@@ -56,6 +56,7 @@ model Workspace {
   bcExtensionTargets      BcExtensionTarget[]
   bcSyncEvents            BcSyncEvent[]
   documentEmbeddings      DocumentEmbedding[]
+  documentLayouts         DocumentLayout[]
 }
 
 model WorkspaceMembership {
@@ -227,10 +228,40 @@ model DocumentRecord {
   targetLinks      DocumentLink[]    @relation("DocumentLinkTarget")
   bcSyncEvents     BcSyncEvent[]
   embeddingRow     DocumentEmbedding?
+  layout           DocumentLayout?
 
   @@unique([workspaceId, sha256])
   @@index([workspaceId, status, createdAt])
   @@index([emailMessageId, createdAt])
+}
+
+/**
+ * Layout OCR de Azure Document Intelligence (modelo prebuilt-layout).
+ * Guardamos páginas con palabras + polígonos para alimentar al LLM con texto OCR
+ * y para resaltar bounding boxes en el visor del documento.
+ *
+ * Estructura sugerida (compacta) en `pages`:
+ *   [{ n: 1, w: 8.5, h: 11, u: "inch", a: 0, words: [{ c, p:[x1,y1,...,x4,y4], cf, s, l }], lines: [...] }]
+ * Tablas (opcional): [{ r, c, cells:[{ r, c, content, polygon, page }] }]
+ */
+model DocumentLayout {
+  id          String   @id @default(cuid())
+  workspaceId String
+  documentId  String   @unique
+  modelId     String
+  apiVersion  String
+  pageCount   Int      @default(0)
+  pages       Json
+  tables      Json?
+  fullText    String?
+  rawHash     String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace      @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  document  DocumentRecord @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, createdAt])
 }
 
 /**

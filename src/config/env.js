@@ -90,6 +90,13 @@ const envSchema = z.object({
   OPENAI_EMBEDDING_DIMS: z.coerce.number().int().min(32).max(3072).default(1536),
   EMBEDDING_MAX_CHARS: z.coerce.number().int().min(500).max(32_000).default(8000),
 
+  AZURE_DI_ENDPOINT: z.string().url().optional().default(""),
+  AZURE_DI_KEY: z.string().optional().default(""),
+  AZURE_DI_API_VERSION: z.string().default("2024-11-30"),
+  AZURE_DI_MODEL_ID: z.string().default("prebuilt-layout"),
+  AZURE_DI_POLL_INTERVAL_MS: z.coerce.number().int().min(250).max(10_000).default(1500),
+  AZURE_DI_MAX_POLL_MS: z.coerce.number().int().min(10_000).max(600_000).default(180_000),
+
   FLOW_WORKER_ENABLED: z.string().optional(),
   FLOW_WORKER_POLL_MS: z.coerce.number().int().min(1000).default(5000),
   FLOW_WORKER_BATCH_SIZE: z.coerce.number().int().min(1).max(500).default(50),
@@ -143,6 +150,12 @@ const raw = parsed.data;
  * @property {string} openaiEmbeddingModel
  * @property {number} openaiEmbeddingDims
  * @property {number} embeddingMaxChars
+ * @property {string} azureDiEndpoint
+ * @property {string} azureDiKey
+ * @property {string} azureDiApiVersion
+ * @property {string} azureDiModelId
+ * @property {number} azureDiPollIntervalMs
+ * @property {number} azureDiMaxPollMs
  * @property {boolean} flowWorkerEnabled
  * @property {number} flowWorkerPollMs
  * @property {number} flowWorkerBatchSize
@@ -193,6 +206,13 @@ const env = Object.freeze({
   openaiEmbeddingModel: raw.OPENAI_EMBEDDING_MODEL,
   openaiEmbeddingDims: raw.OPENAI_EMBEDDING_DIMS,
   embeddingMaxChars: raw.EMBEDDING_MAX_CHARS,
+
+  azureDiEndpoint: raw.AZURE_DI_ENDPOINT.replace(/\/+$/, ""),
+  azureDiKey: raw.AZURE_DI_KEY,
+  azureDiApiVersion: raw.AZURE_DI_API_VERSION,
+  azureDiModelId: raw.AZURE_DI_MODEL_ID,
+  azureDiPollIntervalMs: raw.AZURE_DI_POLL_INTERVAL_MS,
+  azureDiMaxPollMs: raw.AZURE_DI_MAX_POLL_MS,
 
   flowWorkerEnabled: parseBoolean(raw.FLOW_WORKER_ENABLED, true),
   flowWorkerPollMs: raw.FLOW_WORKER_POLL_MS,

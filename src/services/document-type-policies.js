@@ -21,11 +21,24 @@ const semanticMatchPolicySchema = z
   .optional()
   .nullable();
 
+/**
+ * Regla de matching por campo: aplica al evaluar un candidato cuyo tipo coincide
+ * con `targetTypeKey`. Si `sourceField` y `targetField` coinciden según
+ * `comparator`, suma 1 al score estructural (saturando a 1).
+ */
+const fieldJoinRuleSchema = z.object({
+  targetTypeKey: z.string().min(1).max(80),
+  sourceField: z.string().min(1).max(120),
+  targetField: z.string().min(1).max(120),
+  comparator: z.enum(["exact", "ci", "number_close"]).optional().default("exact"),
+});
+
 const matchingPolicySchema = z
   .object({
     enabled: z.boolean().optional().default(true),
     /** Tipos documentales candidatos (keys) contra los que correlacionar, ej remito desde factura */
-    relatedDocumentTypeKeys: z.array(z.string().min(1).max(80)).max(20).optional().default([]),
+    /** Como máximo un tipo destino por ahora (matching 1:1 a nivel de tabla). */
+    relatedDocumentTypeKeys: z.array(z.string().min(1).max(80)).max(1).optional().default([]),
     /** Cardinalidad esperada del vínculo entre documentos */
     relationCardinality: z
       .enum(["ONE_TO_ONE", "ONE_TO_MANY", "MANY_TO_ONE", "MANY_TO_MANY"])
@@ -33,6 +46,11 @@ const matchingPolicySchema = z
       .default("MANY_TO_MANY"),
     autoMatchAfterIngest: z.boolean().optional().default(false),
     minLinkScore: z.number().min(0).max(1).optional().default(0.35),
+    /**
+     * Reglas explícitas para correlacionar documentos por igualdad de campos
+     * extraídos. Si no hay reglas, se usa la heurística por defecto.
+     */
+    fieldJoinRules: z.array(fieldJoinRuleSchema).max(10).optional().default([]),
     semanticMatch: semanticMatchPolicySchema,
   })
   .strict()
@@ -94,7 +112,12 @@ function normalizePolicies(row) {
     },
     matchingPolicy: {
       enabled: mp.enabled !== false,
-      relatedDocumentTypeKeys: Array.isArray(mp.relatedDocumentTypeKeys) ? mp.relatedDocumentTypeKeys : [],
+      relatedDocumentTypeKeys: Array.isArray(mp.relatedDocumentTypeKeys)
+        ? mp.relatedDocumentTypeKeys
+            .map((x) => String(x).trim())
+            .filter(Boolean)
+            .slice(0, 1)
+        : [],
       relationCardinality: ["ONE_TO_ONE", "ONE_TO_MANY", "MANY_TO_ONE", "MANY_TO_MANY"].includes(
         mp.relationCardinality
       )
@@ -102,6 +125,19 @@ function normalizePolicies(row) {
         : "MANY_TO_MANY",
       autoMatchAfterIngest: mp.autoMatchAfterIngest === true,
       minLinkScore: typeof mp.minLinkScore === "number" ? mp.minLinkScore : 0.35,
+      fieldJoinRules: Array.isArray(mp.fieldJoinRules)
+        ? mp.fieldJoinRules
+            .filter((r) => r && typeof r === "object")
+            .map((r) => ({
+              targetTypeKey: String(r.targetTypeKey || "").trim(),
+              sourceField: String(r.sourceField || "").trim(),
+              targetField: String(r.targetField || "").trim(),
+              comparator: ["exact", "ci", "number_close"].includes(r.comparator)
+                ? r.comparator
+                : "exact",
+            }))
+            .filter((r) => r.targetTypeKey && r.sourceField && r.targetField)
+        : [],
       semanticMatch: {
         enabled: sm.enabled === true,
         semanticWeight:

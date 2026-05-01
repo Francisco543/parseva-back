@@ -14,9 +14,16 @@ const { publishEmailJob, publishEmailRetry, publishEmailDlq } = require("../lib/
 const { graphRequest, graphGetBuffer } = require("../lib/graph-client");
 const {
   classifyDocument,
+  classifyDocumentFromOcr,
   normalizeAiExtractionSchema,
   extractFieldsBySchema,
+  extractFieldsFromOcr,
 } = require("./document-extraction.service");
+const {
+  analyzeLayout: analyzeLayoutDi,
+  isConfigured: isAzureDiConfigured,
+} = require("./azure-doc-intelligence.service");
+const { logger } = require("../lib/logger");
 
 const {
   extractInvoiceFromText,
@@ -505,8 +512,19 @@ async function processEmailJob({ jobId, emailMessageId }) {
         };
       });
 
-    /** @type {Map<string, { fields: Record<string, unknown>, confidence: number, notes: string | null, model: string, raw: string | null }>} */
+    /**
+     * @typedef {{
+     *   fields: Record<string, { value: unknown, confidence: number | null, spans: Array<{ page: number, polygon: number[], evidenceText: string }>, evidence: string | null }>,
+     *   confidence: number,
+     *   notes: string | null,
+     *   model: string,
+     *   raw: string | null,
+     * }} OcrSchemaExtraction
+     */
+    /** @type {Map<string, OcrSchemaExtraction>} */
     const perDocSchemaExtractions = new Map();
+    /** @type {Map<string, import("./azure-doc-intelligence.service").OcrLayout>} */
+    const perDocLayouts = new Map();
 
     // Crear un DocumentRecord por cada PDF adjunto.
     for (const att of pdfAttachments) {
@@ -545,15 +563,108 @@ async function processEmailJob({ jobId, emailMessageId }) {
         });
       }
 
-      // Clasificación por IA (tipos 100 % del workspace; BC solo si bcPolicy.enabled en ese tipo)
+      // ==========================================================================
+      //  Stage A: OCR + layout con Azure Document Intelligence (`prebuilt-layout`).
+      //  Persistimos el layout en DocumentLayout para alimentar al LLM y dibujar
+      //  bounding boxes en el visor del frontend.
+      // ==========================================================================
+      let layout = null;
+      if (isAzureDiConfigured()) {
+        try {
+          const existingLayout = await prisma.documentLayout.findUnique({
+            where: { documentId: doc.id },
+          });
+          if (existingLayout && existingLayout.rawHash === sha256) {
+            layout = {
+              modelId: existingLayout.modelId,
+              apiVersion: existingLayout.apiVersion,
+              pageCount: existingLayout.pageCount,
+              pages: existingLayout.pages,
+              tables: existingLayout.tables || [],
+              fullText: existingLayout.fullText || "",
+            };
+          } else {
+            layout = await analyzeLayoutDi(att.buffer, {
+              contentType: att.contentType || "application/pdf",
+            });
+            await prisma.documentLayout.upsert({
+              where: { documentId: doc.id },
+              update: {
+                workspaceId: wsId,
+                modelId: layout.modelId,
+                apiVersion: layout.apiVersion,
+                pageCount: layout.pageCount,
+                pages: layout.pages,
+                tables: layout.tables,
+                fullText: layout.fullText,
+                rawHash: sha256,
+              },
+              create: {
+                workspaceId: wsId,
+                documentId: doc.id,
+                modelId: layout.modelId,
+                apiVersion: layout.apiVersion,
+                pageCount: layout.pageCount,
+                pages: layout.pages,
+                tables: layout.tables,
+                fullText: layout.fullText,
+                rawHash: sha256,
+              },
+            });
+            await createAuditEvent({
+              action: "document.ocr.completed",
+              userId: email.userId,
+              workspaceId: wsId,
+              entityType: "DocumentRecord",
+              entityId: doc.id,
+              metadata: {
+                pages: layout.pageCount,
+                chars: layout.fullText.length,
+                modelId: layout.modelId,
+                apiVersion: layout.apiVersion,
+              },
+            });
+          }
+          if (layout) perDocLayouts.set(doc.id, layout);
+        } catch (errOcr) {
+          const msg = errOcr instanceof Error ? errOcr.message : String(errOcr);
+          logger.warn(
+            { component: "email-automation", err: msg, docId: doc.id },
+            "Azure DI falló; el documento sigue sin OCR (fallback: PDF nativo en OpenAI)"
+          );
+          await createAuditEvent({
+            action: "document.ocr.failed",
+            userId: email.userId,
+            workspaceId: wsId,
+            entityType: "DocumentRecord",
+            entityId: doc.id,
+            metadata: { error: msg.slice(0, 400) },
+          });
+        }
+      }
+
+      // ==========================================================================
+      //  Stage B: Clasificación. Preferimos texto OCR (DI) si está disponible;
+      //  fallback al modo viejo (PDF nativo en OpenAI) si no hay layout.
+      // ==========================================================================
       if (!doc.documentTypeId) {
-        const classification = await classifyDocument({
-          fileName: att.name,
-          pdfBuffer: att.buffer,
-          contextText: `${email.subject}\n${bodyText || ""}`,
-          allowedTypeKeys: enabledTypeKeys,
-          documentTypes: documentTypesForClassifier,
-        });
+        const classification = layout
+          ? await classifyDocumentFromOcr(
+              {
+                ocrText: layout.fullText || "",
+                contextText: `${email.subject}\n${bodyText || ""}`,
+                allowedTypeKeys: enabledTypeKeys,
+                documentTypes: documentTypesForClassifier,
+              },
+              { model: settings.openaiModel }
+            )
+          : await classifyDocument({
+              fileName: att.name,
+              pdfBuffer: att.buffer,
+              contextText: `${email.subject}\n${bodyText || ""}`,
+              allowedTypeKeys: enabledTypeKeys,
+              documentTypes: documentTypesForClassifier,
+            });
 
         const matchedType =
           classification.key != null
@@ -571,7 +682,14 @@ async function processEmailJob({ jobId, emailMessageId }) {
             status: classifiedOk ? "CLASSIFIED" : "NEEDS_REVIEW",
             confidence: typeof classification.confidence === "number" ? classification.confidence : null,
             extractionJson: {
-              classification: classification,
+              classification,
+              ocr: layout
+                ? {
+                    modelId: layout.modelId,
+                    apiVersion: layout.apiVersion,
+                    pageCount: layout.pageCount,
+                  }
+                : null,
             },
             ...(classifiedOk
               ? { lastError: null }
@@ -592,6 +710,7 @@ async function processEmailJob({ jobId, emailMessageId }) {
             key: classification.key,
             confidence: classification.confidence,
             needsReview: !classifiedOk,
+            source: layout ? "ocr+llm" : "pdf+llm",
             ...(classification.rawModelKey ? { rawModelKey: classification.rawModelKey } : {}),
           },
         });
@@ -602,6 +721,9 @@ async function processEmailJob({ jobId, emailMessageId }) {
       // los campos del schema del tipo. Aquí no subimos nada para evitar
       // archivos en rutas con placeholders sin datos (p. ej. "sin_nombre").
 
+      // ==========================================================================
+      //  Stage C: Extracción de campos del schema usando OCR (preferido) o PDF (fallback).
+      // ==========================================================================
       if (
         doc.documentTypeId &&
         att.buffer &&
@@ -612,18 +734,42 @@ async function processEmailJob({ jobId, emailMessageId }) {
         const schemaNorm = normalizeAiExtractionSchema(typeRow?.aiExtractionSchema);
         if (schemaNorm.fields.length > 0) {
           try {
-            const te = await extractFieldsBySchema(
-              {
-                fileName: att.name,
-                pdfBuffer: att.buffer,
-                contextText: `${email.subject}\n${bodyText || ""}`,
-                documentTypeKey: typeRow?.key || "documento",
-                documentTypeLabel: typeRow?.displayName || typeRow?.key || "documento",
-                schema: schemaNorm,
-              },
-              { model: settings.openaiModel }
-            );
-            perDocSchemaExtractions.set(doc.id, te);
+            if (layout) {
+              const teRich = await extractFieldsFromOcr(
+                {
+                  layout,
+                  contextText: `${email.subject}\n${bodyText || ""}`,
+                  documentTypeKey: typeRow?.key || "documento",
+                  documentTypeLabel: typeRow?.displayName || typeRow?.key || "documento",
+                  schema: schemaNorm,
+                },
+                { model: settings.openaiModel }
+              );
+              perDocSchemaExtractions.set(doc.id, teRich);
+            } else {
+              const teLegacy = await extractFieldsBySchema(
+                {
+                  fileName: att.name,
+                  pdfBuffer: att.buffer,
+                  contextText: `${email.subject}\n${bodyText || ""}`,
+                  documentTypeKey: typeRow?.key || "documento",
+                  documentTypeLabel: typeRow?.displayName || typeRow?.key || "documento",
+                  schema: schemaNorm,
+                },
+                { model: settings.openaiModel }
+              );
+              const richFields = {};
+              for (const [k, v] of Object.entries(teLegacy.fields || {})) {
+                richFields[k] = { value: v, confidence: null, spans: [], evidence: null };
+              }
+              perDocSchemaExtractions.set(doc.id, {
+                fields: richFields,
+                confidence: teLegacy.confidence,
+                notes: teLegacy.notes,
+                model: teLegacy.model,
+                raw: teLegacy.raw,
+              });
+            }
           } catch {
             /* degradación: el merge seguirá sin campos de esquema */
           }
@@ -864,7 +1010,14 @@ async function processEmailJob({ jobId, emailMessageId }) {
           const useInvoicePathVars = typeKeyDef === "invoice";
           let extractionFieldsDef = null;
           if (schemaNormDef.fields.length > 0 && teDef?.fields && typeof teDef.fields === "object") {
-            extractionFieldsDef = teDef.fields;
+            const flat = {};
+            for (const [k, v] of Object.entries(teDef.fields)) {
+              flat[k] =
+                v && typeof v === "object" && Object.prototype.hasOwnProperty.call(v, "value")
+                  ? v.value
+                  : v;
+            }
+            extractionFieldsDef = flat;
           } else if (useInvoicePathVars) {
             extractionFieldsDef = {
               vendor_name: p.vendor_name ?? null,
@@ -989,7 +1142,26 @@ async function processEmailJob({ jobId, emailMessageId }) {
         };
 
         if (useSchema && te) {
-          Object.assign(mergedExtraction, te.fields);
+          /** @type {Record<string, unknown>} */
+          const flatValues = {};
+          /** @type {Record<string, { value: unknown, confidence: number | null, spans: Array<{ page: number, polygon: number[], evidenceText: string }>, evidence: string | null }>} */
+          const richFields = {};
+          for (const [k, v] of Object.entries(te.fields || {})) {
+            if (v && typeof v === "object" && Object.prototype.hasOwnProperty.call(v, "value")) {
+              flatValues[k] = v.value;
+              richFields[k] = {
+                value: v.value === undefined ? null : v.value,
+                confidence: typeof v.confidence === "number" ? v.confidence : null,
+                spans: Array.isArray(v.spans) ? v.spans : [],
+                evidence: typeof v.evidence === "string" ? v.evidence : null,
+              };
+            } else {
+              flatValues[k] = v;
+              richFields[k] = { value: v, confidence: null, spans: [], evidence: null };
+            }
+          }
+          Object.assign(mergedExtraction, flatValues);
+          mergedExtraction.fields = richFields;
           mergedExtraction.typeExtraction = {
             confidence: te.confidence,
             model: te.model,
@@ -1437,6 +1609,8 @@ module.exports = {
   processEmailJob,
 
   listEmailJobs,
+
+  loadMessageAttachments,
 
 };
 

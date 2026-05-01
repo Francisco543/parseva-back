@@ -22,7 +22,13 @@ const {
   suggestDocumentTypeExtractionSchema,
 } = require("../services/document-type.service");
 
-const { listDocuments, getDocument } = require("../services/document.service");
+const {
+  listDocuments,
+  getDocument,
+  getDocumentFileBuffer,
+  getDocumentLayout,
+  archiveDocumentToSharePoint,
+} = require("../services/document.service");
 const { approveDocument, rejectDocument } = require("../services/approval.service");
 const { listMappings, upsertMapping } = require("../services/business-central-mapping.service");
 
@@ -111,6 +117,53 @@ router.get(
   asyncHandler(async (req, res) => {
     const item = await getDocument(req.dbUser.id, req.workspace.id, req.params.id);
     res.json({ document: item });
+  })
+);
+
+router.get(
+  "/documents/:id/content",
+  authenticateSession,
+  requireWorkspaceContext,
+  asyncHandler(async (req, res) => {
+    const { buffer, contentType, fileName } = await getDocumentFileBuffer(
+      req.dbUser.id,
+      req.workspace.id,
+      req.params.id
+    );
+    res.setHeader("Content-Type", contentType || "application/octet-stream");
+    res.setHeader(
+      "Content-Disposition",
+      `inline; filename*=UTF-8''${encodeURIComponent(fileName || "documento")}`
+    );
+    res.send(buffer);
+  })
+);
+
+router.get(
+  "/documents/:id/layout",
+  authenticateSession,
+  requireWorkspaceContext,
+  asyncHandler(async (req, res) => {
+    const layout = await getDocumentLayout(
+      req.dbUser.id,
+      req.workspace.id,
+      req.params.id
+    );
+    res.json({ layout });
+  })
+);
+
+router.post(
+  "/documents/:id/archive-sharepoint",
+  authenticateSession,
+  requireWorkspaceContext,
+  asyncHandler(async (req, res) => {
+    const result = await archiveDocumentToSharePoint(
+      req.dbUser.id,
+      req.workspace.id,
+      req.params.id
+    );
+    res.json(result);
   })
 );
 

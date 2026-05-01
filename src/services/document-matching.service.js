@@ -23,12 +23,70 @@ const linkSchema = z.object({
 });
 
 /**
- * Score determinístico en [0,1] a partir de campos de extracción (máx. teórico ~1.0).
+ * Devuelve el valor en una ruta puntuada (`a.b.c`) dentro de un JSON.
+ * @param {unknown} obj
+ * @param {string} dotted
+ */
+function getPath(obj, dotted) {
+  const parts = String(dotted || "").split(".").filter(Boolean);
+  let cur = obj;
+  for (const p of parts) {
+    if (cur == null || typeof cur !== "object") return undefined;
+    cur = cur[p];
+  }
+  return cur;
+}
+
+/** Compara dos valores extraídos según un comparador declarado por la regla. */
+function compareValues(a, b, comparator) {
+  if (a == null || b == null) return false;
+  if (a === "" || b === "") return false;
+  const cmp = comparator || "exact";
+  if (cmp === "exact") return String(a) === String(b);
+  if (cmp === "ci")
+    return String(a).trim().toLowerCase() === String(b).trim().toLowerCase();
+  if (cmp === "number_close") {
+    const na = Number(a);
+    const nb = Number(b);
+    if (!Number.isFinite(na) || !Number.isFinite(nb)) return false;
+    const tol = Math.max(2, Math.abs(na) * 0.02);
+    return Math.abs(na - nb) <= tol;
+  }
+  return false;
+}
+
+/**
+ * Score determinístico en [0,1] a partir de campos de extracción.
+ * Si hay `fieldJoinRules` aplicables al `targetTypeKey` (tipo del candidato),
+ * suma 1 por cada regla que matchea (cap 1). Si no hay reglas para ese tipo,
+ * cae al heurístico legacy (purchase_order / vendor_tax_id / total_amount).
+ *
  * @param {Record<string, unknown>} src
  * @param {Record<string, unknown>} tgt
- * @returns {number}
+ * @param {{ targetTypeKey: string|null, fieldJoinRules: Array<{targetTypeKey:string,sourceField:string,targetField:string,comparator?:string}> }} ctx
+ * @returns {{ score: number, hits: Array<{rule: object, srcValue: unknown, tgtValue: unknown}> }}
  */
-function structuralMatchScore(src, tgt) {
+function structuralMatchScore(src, tgt, ctx = {}) {
+  const rules = Array.isArray(ctx.fieldJoinRules) ? ctx.fieldJoinRules : [];
+  const targetTypeKey = ctx.targetTypeKey || null;
+  const applicable = targetTypeKey
+    ? rules.filter((r) => r && r.targetTypeKey === targetTypeKey)
+    : rules;
+
+  if (applicable.length > 0) {
+    let score = 0;
+    const hits = [];
+    for (const rule of applicable) {
+      const srcValue = getPath(src, rule.sourceField);
+      const tgtValue = getPath(tgt, rule.targetField);
+      if (compareValues(srcValue, tgtValue, rule.comparator)) {
+        score += 1;
+        hits.push({ rule, srcValue, tgtValue });
+      }
+    }
+    return { score: Math.min(1, score), hits };
+  }
+
   let score = 0;
   if (src.purchase_order && tgt.purchase_order && src.purchase_order === tgt.purchase_order) score += 0.55;
   if (src.vendor_tax_id && tgt.vendor_tax_id && src.vendor_tax_id === tgt.vendor_tax_id) score += 0.25;
@@ -40,7 +98,7 @@ function structuralMatchScore(src, tgt) {
       if (diff <= Math.max(2, a * 0.02)) score += 0.2;
     }
   }
-  return Math.min(1, score);
+  return { score: Math.min(1, score), hits: [] };
 }
 
 /**
@@ -149,6 +207,7 @@ async function runAutoMatchForDocument(workspaceId, documentId) {
     },
     take: 100,
     orderBy: { createdAt: "desc" },
+    include: { documentType: { select: { key: true } } },
   });
 
   const semCfg = matchPol.semanticMatch || {};
@@ -184,6 +243,7 @@ async function runAutoMatchForDocument(workspaceId, documentId) {
   if (missingIds.length) {
     const extra = await prisma.documentRecord.findMany({
       where: { workspaceId, id: { in: missingIds } },
+      include: { documentType: { select: { key: true } } },
     });
     for (const d of extra) heuristicById.set(d.id, d);
   }
@@ -193,6 +253,7 @@ async function runAutoMatchForDocument(workspaceId, documentId) {
   const relation = matchPol.relationCardinality || "MANY_TO_MANY";
   const minScore = typeof matchPol.minLinkScore === "number" ? matchPol.minLinkScore : 0.35;
   const wSem = semanticOn && sourceHasEmbedding ? semCfg.semanticWeight : 0;
+  const fieldJoinRules = Array.isArray(matchPol.fieldJoinRules) ? matchPol.fieldJoinRules : [];
 
   async function cardinalityAllows(targetDocumentId) {
     if (relation === "MANY_TO_MANY") return true;
@@ -215,7 +276,12 @@ async function runAutoMatchForDocument(workspaceId, documentId) {
     if (!c) continue;
 
     const tgtEx = c.extractionJson && typeof c.extractionJson === "object" ? c.extractionJson : {};
-    const structScore = structuralMatchScore(srcEx, tgtEx);
+    const targetTypeKey = c.documentType?.key || null;
+    const { score: structScore, hits: ruleHits } = structuralMatchScore(
+      srcEx,
+      tgtEx,
+      { targetTypeKey, fieldJoinRules }
+    );
 
     const semSim = semanticById.get(cid);
 
@@ -239,6 +305,12 @@ async function runAutoMatchForDocument(workspaceId, documentId) {
         semanticSimilarity: semSim != null ? Number(semSim.toFixed(4)) : null,
         semanticUsed: usedSemantic,
         semanticWeight: wSem,
+        fieldJoinHits: ruleHits.map((h) => ({
+          targetTypeKey: h.rule.targetTypeKey,
+          sourceField: h.rule.sourceField,
+          targetField: h.rule.targetField,
+          comparator: h.rule.comparator || "exact",
+        })),
       },
     });
     links.push(link);
