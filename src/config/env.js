@@ -74,13 +74,26 @@ const envSchema = z.object({
   KAFKA_EMAIL_DLQ_TOPIC: z.string().default("email-processing-jobs.dlq"),
   KAFKA_EMAIL_MAX_ATTEMPTS: z.coerce.number().int().min(1).max(20).default(5),
 
+  /** Topic para jobs de envío a Business Central (un mensaje por `BcSyncEvent`). */
+  KAFKA_BC_SYNC_TOPIC: z.string().default("parseva-bc-sync"),
+  /** Consumer group dedicado (no reutilizar el de email). */
+  KAFKA_BC_SYNC_GROUP_ID: z.string().default("parseva-bc-sync-workers"),
+  /** DLQ opcional: fallos definitivos de sync BC (observabilidad / replay manual). */
+  KAFKA_BC_SYNC_DLQ_TOPIC: z.string().default("parseva-bc-sync.dlq"),
+
   PUBLIC_API_BASE_URL: z.string().url().default("http://localhost:4000/api"),
 
   GRAPH_TENANT_ID: z.string().optional(),
   GRAPH_CLIENT_ID: z.string().optional(),
   GRAPH_CLIENT_SECRET: z.string().optional(),
-  GRAPH_RENEW_INTERVAL_MS: z.coerce.number().int().min(10_000).default(300_000),
-  GRAPH_RENEW_BEFORE_MS: z.coerce.number().int().min(60_000).default(1_200_000),
+  /** Renovar suscripciones Graph cada X ms (default 1 h; el worker corre en segundo plano). */
+  GRAPH_RENEW_INTERVAL_MS: z.coerce.number().int().min(10_000).default(3_600_000),
+  /**
+   * Renovar si la suscripción vence dentro de esta ventana (default 48 h).
+   * Así hay margen si el proceso estuvo caído un rato.
+   */
+  GRAPH_RENEW_BEFORE_MS: z.coerce.number().int().min(60_000).default(172_800_000),
+  GRAPH_RENEW_WORKER_ENABLED: z.string().optional(),
 
   OPENAI_API_KEY: z.string().optional().default(""),
   OPENAI_MODEL: z.string().default("gpt-4o-mini"),
@@ -100,6 +113,17 @@ const envSchema = z.object({
   FLOW_WORKER_ENABLED: z.string().optional(),
   FLOW_WORKER_POLL_MS: z.coerce.number().int().min(1000).default(5000),
   FLOW_WORKER_BATCH_SIZE: z.coerce.number().int().min(1).max(500).default(50),
+
+  /** Sin integración BC configurada: si true, el worker simula éxito (solo desarrollo). */
+  BC_ERP_USE_MOCK: z.string().optional(),
+  BC_ERP_TIMEOUT_MS: z.coerce.number().int().min(3000).max(120000).default(60000),
+
+  /**
+   * App Entra multi-inquilino Parseva: client credentials contra el tenant del
+   * cliente (ver integration business_central). Vacío = solo override por workspace o Bearer manual.
+   */
+  BC_CONNECTOR_CLIENT_ID: z.string().optional().default(""),
+  BC_CONNECTOR_CLIENT_SECRET: z.string().optional().default(""),
 });
 
 const parsed = envSchema.safeParse(process.env);
@@ -137,12 +161,16 @@ const raw = parsed.data;
  * @property {string} kafkaEmailRetryTopic
  * @property {string} kafkaEmailDlqTopic
  * @property {number} kafkaEmailMaxAttempts
+ * @property {string} kafkaBcSyncTopic
+ * @property {string} kafkaBcSyncGroupId
+ * @property {string} kafkaBcSyncDlqTopic
  * @property {string} publicApiBaseUrl
  * @property {string} graphTenantId
  * @property {string} graphClientId
  * @property {string} graphClientSecret
  * @property {number} graphRenewIntervalMs
  * @property {number} graphRenewBeforeMs
+ * @property {boolean} graphRenewWorkerEnabled
  * @property {string} openaiApiKey
  * @property {string} openaiModel
  * @property {string} openaiPdfModel
@@ -159,6 +187,8 @@ const raw = parsed.data;
  * @property {boolean} flowWorkerEnabled
  * @property {number} flowWorkerPollMs
  * @property {number} flowWorkerBatchSize
+ * @property {string} bcConnectorClientId
+ * @property {string} bcConnectorClientSecret
  */
 
 /** @type {AppEnv} */
@@ -191,6 +221,10 @@ const env = Object.freeze({
   kafkaEmailDlqTopic: raw.KAFKA_EMAIL_DLQ_TOPIC,
   kafkaEmailMaxAttempts: raw.KAFKA_EMAIL_MAX_ATTEMPTS,
 
+  kafkaBcSyncTopic: raw.KAFKA_BC_SYNC_TOPIC,
+  kafkaBcSyncGroupId: raw.KAFKA_BC_SYNC_GROUP_ID,
+  kafkaBcSyncDlqTopic: raw.KAFKA_BC_SYNC_DLQ_TOPIC,
+
   publicApiBaseUrl: raw.PUBLIC_API_BASE_URL,
 
   graphTenantId: raw.GRAPH_TENANT_ID || raw.MSAL_TENANT_ID,
@@ -198,6 +232,7 @@ const env = Object.freeze({
   graphClientSecret: raw.GRAPH_CLIENT_SECRET || raw.MSAL_CLIENT_SECRET,
   graphRenewIntervalMs: raw.GRAPH_RENEW_INTERVAL_MS,
   graphRenewBeforeMs: raw.GRAPH_RENEW_BEFORE_MS,
+  graphRenewWorkerEnabled: parseBoolean(raw.GRAPH_RENEW_WORKER_ENABLED, true),
 
   openaiApiKey: raw.OPENAI_API_KEY,
   openaiModel: raw.OPENAI_MODEL,
@@ -217,6 +252,12 @@ const env = Object.freeze({
   flowWorkerEnabled: parseBoolean(raw.FLOW_WORKER_ENABLED, true),
   flowWorkerPollMs: raw.FLOW_WORKER_POLL_MS,
   flowWorkerBatchSize: raw.FLOW_WORKER_BATCH_SIZE,
+
+  bcErpUseMock: parseBoolean(raw.BC_ERP_USE_MOCK, raw.NODE_ENV !== "production"),
+  bcErpTimeoutMs: raw.BC_ERP_TIMEOUT_MS,
+
+  bcConnectorClientId: (raw.BC_CONNECTOR_CLIENT_ID || "").trim(),
+  bcConnectorClientSecret: (raw.BC_CONNECTOR_CLIENT_SECRET || "").trim(),
 });
 
 module.exports = env;

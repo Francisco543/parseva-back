@@ -18,6 +18,8 @@ const {
   ingestEmailEvent,
   listEmailJobs,
 } = require("../services/email-automation.service");
+const { PERMISSIONS } = require("../constants/rbac");
+const { requirePermission } = require("../middlewares/rbac.middleware");
 
 const router = express.Router();
 
@@ -25,6 +27,7 @@ router.post(
   "/email/events",
   authenticateSession,
   requireWorkspaceContext,
+  requirePermission(PERMISSIONS.DOCUMENTS_MANAGE),
   asyncHandler(async (req, res) => {
     const result = await ingestEmailEvent(
       req.dbUser.id,
@@ -44,6 +47,7 @@ router.get(
   "/email/jobs",
   authenticateSession,
   requireWorkspaceContext,
+  requirePermission(PERMISSIONS.DOCUMENTS_READ),
   asyncHandler(async (req, res) => {
     const items = await listEmailJobs(req.dbUser.id, req.workspace.id);
     res.json({ items });

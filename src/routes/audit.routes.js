@@ -9,6 +9,8 @@ const { authenticateSession } = require("../middlewares/session-auth.middleware"
 const { requireWorkspaceContext } = require("../middlewares/workspace-context.middleware");
 const asyncHandler = require("../utils/async-handler");
 const { listAuditEvents } = require("../services/audit.service");
+const { PERMISSIONS } = require("../constants/rbac");
+const { requirePermission } = require("../middlewares/rbac.middleware");
 
 const router = express.Router();
 
@@ -16,6 +18,7 @@ router.get(
   "/audit/events",
   authenticateSession,
   requireWorkspaceContext,
+  requirePermission(PERMISSIONS.AUDIT_READ),
   asyncHandler(async (req, res) => {
     const take = Math.min(200, Math.max(1, Number(req.query.take || 50)));
     const skip = Math.max(0, Number(req.query.skip || 0));

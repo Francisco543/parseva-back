@@ -12,6 +12,8 @@ const asyncHandler = require("../utils/async-handler");
 const prisma = require("../lib/prisma");
 const { resolveSiteFromUrl } = require("../services/sharepoint.service");
 const HttpError = require("../utils/http-error");
+const { PERMISSIONS } = require("../constants/rbac");
+const { requirePermission } = require("../middlewares/rbac.middleware");
 
 const router = express.Router();
 
@@ -23,6 +25,7 @@ router.post(
   "/sharepoint/resolve-site",
   authenticateSession,
   requireWorkspaceContext,
+  requirePermission(PERMISSIONS.CONFIG_WRITE),
   asyncHandler(async (req, res) => {
     const parsed = resolveSchema.safeParse(req.body || {});
     if (!parsed.success) {

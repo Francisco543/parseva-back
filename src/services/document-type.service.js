@@ -5,6 +5,10 @@ const env = require("../config/env");
 const { policiesPatchSchema } = require("./document-type-policies");
 const { suggestAiExtractionSchema } = require("./document-extraction.service");
 const { validateSharePointPathTemplate } = require("./sharepoint-path-template");
+const {
+  DOCUMENT_TYPE_TEMPLATE_VERSION,
+  DOCUMENT_TYPE_TEMPLATES,
+} = require("./document-type-template-catalog.service");
 
 const createSchema = z.object({
   key: z.string().trim().min(2).max(40),
@@ -29,7 +33,129 @@ const suggestExtractionBodySchema = z.object({
   baseSchema: z.any().optional().nullable(),
 });
 
+const TEMPLATE_MANAGED_PATCH_KEYS = [
+  "displayName",
+  "sharePointPathTemplate",
+  "requireApprovalBeforeErp",
+  "aiExtractionSchema",
+  "sharepointRouting",
+  "matchingPolicy",
+  "approvalPolicy",
+  "validationPolicy",
+  "bcPolicy",
+  "configVersion",
+];
+
+/**
+ * @param {string} workspaceId
+ * @param {import("./document-type-template-catalog.service").DocTypeTemplate} tpl
+ */
+function templateToCreateData(workspaceId, tpl) {
+  return {
+    workspaceId,
+    key: tpl.key,
+    displayName: tpl.displayName,
+    enabled: tpl.enabled,
+    sharePointPathTemplate: tpl.sharePointPathTemplate ?? null,
+    requireApprovalBeforeErp: tpl.requireApprovalBeforeErp !== false,
+    aiExtractionSchema: tpl.aiExtractionSchema ?? null,
+    sharepointRouting: tpl.sharepointRouting ?? undefined,
+    matchingPolicy: tpl.matchingPolicy ?? undefined,
+    approvalPolicy: tpl.approvalPolicy ?? undefined,
+    validationPolicy: tpl.validationPolicy ?? undefined,
+    bcPolicy: tpl.bcPolicy ?? undefined,
+    configVersion: 1,
+    baseTemplateKey: tpl.key,
+    baseTemplateVersion: DOCUMENT_TYPE_TEMPLATE_VERSION,
+    isTemplateCustomized: false,
+    templateCustomizedAt: null,
+  };
+}
+
+/**
+ * Garantiza que el workspace tenga el catalogo base BC cargado.
+ * No pisa tipos personalizados salvo que se pida `forceRefresh`.
+ *
+ * @param {string} workspaceId
+ * @param {{ forceRefresh?: boolean }} [opts]
+ */
+async function ensureWorkspaceDefaultDocumentTypes(workspaceId, opts = {}) {
+  const forceRefresh = opts.forceRefresh === true;
+  const existing = await prisma.documentType.findMany({
+    where: { workspaceId },
+    orderBy: { createdAt: "asc" },
+  });
+  const byKey = new Map(existing.map((row) => [row.key, row]));
+
+  let created = 0;
+  let updated = 0;
+  let skippedCustomized = 0;
+  let alreadyCurrent = 0;
+
+  for (const tpl of DOCUMENT_TYPE_TEMPLATES) {
+    const row = byKey.get(tpl.key);
+    if (!row) {
+      await prisma.documentType.create({
+        data: templateToCreateData(workspaceId, tpl),
+      });
+      created += 1;
+      continue;
+    }
+
+    const shouldSkip = row.isTemplateCustomized && !forceRefresh;
+    if (shouldSkip) {
+      skippedCustomized += 1;
+      continue;
+    }
+
+    const isCurrent =
+      row.baseTemplateKey === tpl.key &&
+      Number(row.baseTemplateVersion || 0) >= DOCUMENT_TYPE_TEMPLATE_VERSION;
+    if (isCurrent && !forceRefresh) {
+      alreadyCurrent += 1;
+      continue;
+    }
+
+    await prisma.documentType.update({
+      where: { id: row.id },
+      data: {
+        displayName: tpl.displayName,
+        sharePointPathTemplate: tpl.sharePointPathTemplate ?? null,
+        requireApprovalBeforeErp: tpl.requireApprovalBeforeErp !== false,
+        aiExtractionSchema: tpl.aiExtractionSchema ?? null,
+        sharepointRouting: tpl.sharepointRouting ?? undefined,
+        matchingPolicy: tpl.matchingPolicy ?? undefined,
+        approvalPolicy: tpl.approvalPolicy ?? undefined,
+        validationPolicy: tpl.validationPolicy ?? undefined,
+        bcPolicy: tpl.bcPolicy ?? undefined,
+        configVersion: 1,
+        baseTemplateKey: tpl.key,
+        baseTemplateVersion: DOCUMENT_TYPE_TEMPLATE_VERSION,
+        ...(forceRefresh
+          ? {
+              enabled: tpl.enabled,
+              isTemplateCustomized: false,
+              templateCustomizedAt: null,
+            }
+          : {}),
+      },
+    });
+    updated += 1;
+  }
+
+  return {
+    templateVersion: DOCUMENT_TYPE_TEMPLATE_VERSION,
+    templateCount: DOCUMENT_TYPE_TEMPLATES.length,
+    created,
+    updated,
+    skippedCustomized,
+    alreadyCurrent,
+    forceRefresh,
+  };
+}
+
 async function listDocumentTypes(workspaceId) {
+  await ensureWorkspaceDefaultDocumentTypes(workspaceId);
   return prisma.documentType.findMany({
     where: { workspaceId },
     orderBy: [{ enabled: "desc" }, { createdAt: "asc" }],
@@ -63,6 +189,10 @@ async function createDocumentType(workspaceId, input) {
       validationPolicy: d.validationPolicy ?? undefined,
       bcPolicy: d.bcPolicy ?? undefined,
       configVersion: d.configVersion ?? 1,
+      baseTemplateKey: null,
+      baseTemplateVersion: null,
+      isTemplateCustomized: true,
+      templateCustomizedAt: new Date(),
     },
   });
 }
@@ -91,10 +221,21 @@ async function patchDocumentType(workspaceId, id, input) {
         "o tokens legacy de factura (vendor_slug, invoice_number, etc.)."
     );
   }
+  const marksCustomized = TEMPLATE_MANAGED_PATCH_KEYS.some(
+    (k) => Object.prototype.hasOwnProperty.call(parsed.data, k)
+  );
 
   return prisma.documentType.update({
     where: { id },
-    data,
+    data: {
+      ...data,
+      ...(existing.baseTemplateKey && marksCustomized
+        ? {
+            isTemplateCustomized: true,
+            templateCustomizedAt: new Date(),
+          }
+        : {}),
+    },
   });
 }
 
@@ -159,4 +300,5 @@ module.exports = {
   createDocumentType,
   patchDocumentType,
   suggestDocumentTypeExtractionSchema,
+  ensureWorkspaceDefaultDocumentTypes,
 };

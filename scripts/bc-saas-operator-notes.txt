@@ -1,0 +1,8 @@
+BC SaaS — operaciones
+---------------------
+Consentimiento de administrador por tenant cliente (app Entra multi-inquilino Parseva):
+  https://login.microsoftonline.com/common/adminconsent?client_id=<BC_CONNECTOR_CLIENT_ID>&redirect_uri=<redirect_URI_registrada_en_la_app>
+
+Tras el consentimiento, el workspace solo necesita inquilino (GUID), nombre del entorno BC y empresa en Integraciones.
+
+Credenciales BC_CONNECTOR_* solo en el proceso Parseva (env / Key Vault), nunca en la UI del cliente.

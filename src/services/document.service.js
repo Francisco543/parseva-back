@@ -1,29 +1,103 @@
 const crypto = require("node:crypto");
+const { z } = require("zod");
 
 const prisma = require("../lib/prisma");
 const HttpError = require("../utils/http-error");
-const { graphGetBuffer } = require("../lib/graph-client");
 const {
   buildStoragePath,
   safeFileName,
   slugify,
-  uploadDriveItem,
 } = require("./sharepoint.service");
-const { coerceSettings } = require("./workspace-automation.service");
+const { coerceSettings, getArchiveIntegrationId } = require("./workspace-automation.service");
+const {
+  archiveUploadFromIntegration,
+  downloadArchivedDocumentBuffer,
+  assertArchiveIntegration,
+} = require("./document-archive-storage.service");
+const { INTEGRATION_KIND } = require("../constants/integration");
+const { AUDIT_ACTION } = require("../constants/audit-actions");
 const {
   normalizeAiExtractionSchema,
 } = require("./document-extraction.service");
 const { createAuditEvent } = require("./audit.service");
 
-async function listDocuments(userId, workspaceId, query = {}) {
+function isTruthyQueryFlag(v) {
+  return v === true || v === "1" || v === "true";
+}
+
+/**
+ * Documentos aprobados cuyo tipo tiene BC en modo MANUAL con perfil — pendientes de envío explícito.
+ *
+ * @param {string} workspaceId
+ * @param {number} take
+ */
+async function listDocumentsPendingBcManual(workspaceId, take) {
+  const rows = await prisma.documentRecord.findMany({
+    where: {
+      workspaceId,
+      status: "APPROVED",
+    },
+    orderBy: { updatedAt: "desc" },
+    take: Math.min(200, Math.max(1, take)),
+    include: {
+      documentType: {
+        select: {
+          id: true,
+          key: true,
+          displayName: true,
+          bcPolicy: true,
+          aiExtractionSchema: true,
+        },
+      },
+      emailMessage: { select: { id: true, subject: true, sender: true, receivedAt: true } },
+    },
+  });
+
+  return rows.filter((doc) => {
+    const bp = doc.documentType?.bcPolicy;
+    if (!bp || typeof bp !== "object") return false;
+    const enabled = bp.enabled === true;
+    const manual = bp.syncMode === "MANUAL";
+    const profileId =
+      typeof bp.mappingProfileId === "string" && bp.mappingProfileId.trim().length > 0
+        ? bp.mappingProfileId.trim()
+        : null;
+    return enabled && manual && Boolean(profileId);
+  });
+}
+
+async function listDocuments(_userId, workspaceId, query = {}) {
   const take = Math.min(200, Math.max(1, Number(query.take || 50)));
+  const pendingBcManual = isTruthyQueryFlag(query.pendingBcManual);
+  if (pendingBcManual) {
+    return listDocumentsPendingBcManual(workspaceId, take);
+  }
+
   const status = query.status ? String(query.status) : null;
   const typeKey = query.type ? String(query.type) : null;
   const q = query.q ? String(query.q).trim() : "";
 
+  /** @type {string[] | null} */
+  let searchIds = null;
+  if (q) {
+    const pattern = `%${q}%`;
+    const rows = await prisma.$queryRaw`
+      SELECT d.id FROM "DocumentRecord" d
+      WHERE d."workspaceId" = ${workspaceId}
+        AND (
+          d."fileName" ILIKE ${pattern}
+          OR COALESCE(d."lastError", '') ILIKE ${pattern}
+          OR d."extractionJson"::text ILIKE ${pattern}
+        )
+    `;
+    searchIds = rows.map((r) => r.id);
+    if (searchIds.length === 0) {
+      return [];
+    }
+  }
+
   return prisma.documentRecord.findMany({
     where: {
-      userId,
       workspaceId,
       ...(status ? { status } : {}),
       ...(typeKey
@@ -33,14 +107,7 @@ async function listDocuments(userId, workspaceId, query = {}) {
             },
           }
         : {}),
-      ...(q
-        ? {
-            OR: [
-              { fileName: { contains: q, mode: "insensitive" } },
-              { lastError: { contains: q, mode: "insensitive" } },
-            ],
-          }
-        : {}),
+      ...(searchIds ? { id: { in: searchIds } } : {}),
     },
     orderBy: { createdAt: "desc" },
     take,
@@ -55,11 +122,16 @@ async function listDocuments(userId, workspaceId, query = {}) {
 
 async function getDocument(userId, workspaceId, id) {
   const doc = await prisma.documentRecord.findFirst({
-    where: { id, userId, workspaceId },
+    where: { id, workspaceId },
     include: {
       documentType: true,
       emailMessage: true,
-      approvalRequests: { orderBy: { createdAt: "desc" } },
+      approvalRequests: {
+        orderBy: { createdAt: "desc" },
+        include: {
+          assignee: { select: { id: true, email: true, fullName: true } },
+        },
+      },
     },
   });
   if (!doc) throw new HttpError(404, "Document not found");
@@ -67,44 +139,26 @@ async function getDocument(userId, workspaceId, id) {
 }
 
 /**
- * Descarga el binario del adjunto vía Microsoft Graph (item en drive).
- * Requiere que el documento ya esté vinculado a SharePoint.
+ * Descarga el binario del documento desde el destino donde fue archivado
+ * (SharePoint vía Graph, Amazon S3 o Azure Blob según `archiveStorageKind`).
  *
  * @returns {{ buffer: Buffer, contentType: string, fileName: string }}
  */
 async function getDocumentFileBuffer(userId, workspaceId, id) {
   const doc = await prisma.documentRecord.findFirst({
-    where: { id, userId, workspaceId },
+    where: { id, workspaceId },
     include: {
       workspace: { select: { aadTenantId: true } },
     },
   });
   if (!doc) throw new HttpError(404, "Document not found");
-  if (!doc.sharepointDriveId || !doc.sharepointItemId) {
-    throw new HttpError(
-      404,
-      "El archivo aún no está disponible para descarga (falta referencia de SharePoint)."
-    );
-  }
-  const tenantId = doc.workspace?.aadTenantId;
-  if (!tenantId) {
-    throw new HttpError(500, "Workspace sin tenant de Azure AD");
-  }
-  const path = `/drives/${encodeURIComponent(doc.sharepointDriveId)}/items/${encodeURIComponent(
-    doc.sharepointItemId
-  )}/content`;
   try {
-    const buffer = await graphGetBuffer(path, { tenantId });
-    return {
-      buffer,
-      contentType: doc.contentType || "application/octet-stream",
-      fileName: doc.fileName || "documento",
-    };
+    return await downloadArchivedDocumentBuffer(doc, doc.workspace);
   } catch (err) {
     if (err instanceof HttpError) throw err;
     throw new HttpError(
       502,
-      "No se pudo descargar el archivo desde Microsoft Graph",
+      "No se pudo descargar el archivo",
       err?.message ? String(err.message) : undefined
     );
   }
@@ -124,7 +178,7 @@ async function getDocumentFileBuffer(userId, workspaceId, id) {
  */
 async function getDocumentLayout(userId, workspaceId, id) {
   const doc = await prisma.documentRecord.findFirst({
-    where: { id, userId, workspaceId },
+    where: { id, workspaceId },
     select: { id: true },
   });
   if (!doc) throw new HttpError(404, "Document not found");
@@ -149,18 +203,15 @@ async function getDocumentLayout(userId, workspaceId, id) {
 }
 
 /**
- * Sube (o re-sube) un `DocumentRecord` a SharePoint usando los datos ya
- * extraídos. Útil cuando el documento se procesó antes de tener la integración
- * configurada o falló su archivado.
+ * Sube (o re-sube) un `DocumentRecord` al destino de archivado del workspace
+ * (SharePoint, Amazon S3 o Azure Blob) usando los datos ya extraídos.
  *
  * Flujo:
  *  1. Carga el documento con su workspace, email y tipo.
- *  2. Resuelve la integración SP del workspace y verifica `configJson.driveId`.
- *  3. Recupera el binario del adjunto desde el email original (Microsoft Graph),
- *     buscando el `fileAttachment` cuyo SHA-256 matchea al guardado.
- *  4. Construye la ruta destino con `buildStoragePath` aplicando el routing del
- *     tipo o el del workspace, usando los valores ya extraídos en `extractionJson`.
- *  5. Sube el archivo y persiste las referencias SharePoint.
+ *  2. Resuelve la integración de archivado (`storageIntegrationId` / legacy SharePoint).
+ *  3. Recupera el binario del adjunto desde el correo (Graph), por SHA-256.
+ *  4. Construye la ruta con `buildStoragePath` según tipo/workspace y extracción.
+ *  5. Sube el archivo y persiste referencias (`archiveStorageKind`, columnas SharePoint reutilizadas para claves S3/Azure).
  *
  * @param {string} userId
  * @param {string} workspaceId
@@ -169,7 +220,7 @@ async function getDocumentLayout(userId, workspaceId, id) {
  */
 async function archiveDocumentToSharePoint(userId, workspaceId, id) {
   const doc = await prisma.documentRecord.findFirst({
-    where: { id, userId, workspaceId },
+    where: { id, workspaceId },
     include: {
       documentType: true,
       emailMessage: { include: { integration: true } },
@@ -186,27 +237,16 @@ async function archiveDocumentToSharePoint(userId, workspaceId, id) {
   }
 
   const settings = coerceSettings(doc.workspace.automationSettings);
-  const spIntegrationId = settings.sharepointIntegrationId;
-  if (!spIntegrationId) {
+  const archiveIntegrationId = getArchiveIntegrationId(doc.workspace.automationSettings);
+  if (!archiveIntegrationId) {
     throw new HttpError(
       409,
-      "El workspace no tiene una integración SharePoint configurada en automatización."
+      "El workspace no tiene una integración de archivado configurada en automatización."
     );
   }
 
-  const sp = await prisma.integrationConnection.findFirst({
-    where: { id: spIntegrationId, workspaceId, kind: "sharepoint" },
-  });
-  if (!sp) {
-    throw new HttpError(404, "Integración SharePoint no encontrada en este workspace.");
-  }
-  const cfg = sp.configJson && typeof sp.configJson === "object" ? sp.configJson : {};
-  if (!cfg.driveId) {
-    throw new HttpError(
-      409,
-      "La integración SharePoint no tiene `driveId` configurado; volvé a conectar el sitio."
-    );
-  }
+  /** @type {import("@prisma/client").IntegrationConnection} */
+  const integration = await assertArchiveIntegration(workspaceId, archiveIntegrationId);
 
   const email = doc.emailMessage;
   if (!email || !email.integration || !email.externalId) {
@@ -293,62 +333,277 @@ async function archiveDocumentToSharePoint(userId, workspaceId, id) {
   const base = `${slugify(typeKey || "documento")}_${doc.sha256.slice(0, 10)}`;
   const relative = `${folder}/${safeFileName(base)}`;
 
-  let uploaded;
+  let uploadData;
   try {
-    uploaded = await uploadDriveItem(
-      doc.workspace.aadTenantId,
-      cfg.driveId,
-      relative,
-      matching.buffer,
-      matching.contentType
-    );
+    uploadData = await archiveUploadFromIntegration({
+      tenantId: doc.workspace.aadTenantId,
+      integration,
+      integrationId: archiveIntegrationId,
+      relativePath: relative,
+      buffer: matching.buffer,
+      contentType: matching.contentType,
+    });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
+    const prefix = `${integration.kind}:`;
     await prisma.documentRecord.update({
       where: { id: doc.id },
-      data: { lastError: `SharePoint: ${msg.slice(0, 600)}` },
+      data: { lastError: `${prefix} ${msg.slice(0, 580)}` },
     });
     await createAuditEvent({
-      action: "document.archive_failed.sharepoint",
+      action:
+        integration.kind === INTEGRATION_KIND.SHAREPOINT
+          ? AUDIT_ACTION.DOCUMENT_ARCHIVE_FAILED_SHAREPOINT
+          : AUDIT_ACTION.DOCUMENT_ARCHIVE_FAILED_STORAGE,
       userId,
       workspaceId,
       entityType: "DocumentRecord",
       entityId: doc.id,
-      metadata: { error: msg.slice(0, 600), phase: "manual_retry" },
+      metadata: {
+        error: msg.slice(0, 600),
+        phase: "manual_retry",
+        storageKind: integration.kind,
+      },
     });
-    throw new HttpError(502, `No se pudo subir el archivo a SharePoint: ${msg.slice(0, 300)}`);
+    throw new HttpError(
+      502,
+      `No se pudo archivar el archivo (${integration.kind}): ${msg.slice(0, 300)}`
+    );
   }
 
   const updated = await prisma.documentRecord.update({
     where: { id: doc.id },
-    data: {
-      status: "ARCHIVED",
-      sharepointSiteId: cfg.siteId || null,
-      sharepointDriveId: cfg.driveId,
-      sharepointItemId: uploaded?.id || null,
-      sharepointWebUrl: uploaded?.webUrl || null,
-      sharepointPath: relative,
-      lastError: null,
-    },
+    data: uploadData,
   });
   await createAuditEvent({
-    action: "document.archived.sharepoint",
+    action:
+      integration.kind === INTEGRATION_KIND.SHAREPOINT
+        ? AUDIT_ACTION.DOCUMENT_ARCHIVED_SHAREPOINT
+        : AUDIT_ACTION.DOCUMENT_ARCHIVED_STORAGE,
     userId,
     workspaceId,
     entityType: "DocumentRecord",
     entityId: doc.id,
     metadata: {
       sharepointPath: relative,
-      webUrl: uploaded?.webUrl || null,
+      webUrl: uploadData.sharepointWebUrl || null,
       phase: "manual_retry",
+      storageKind: integration.kind,
     },
   });
 
   return {
     document: updated,
     sharepointPath: relative,
-    webUrl: uploaded?.webUrl || null,
+    webUrl: uploadData.sharepointWebUrl || null,
   };
+}
+
+const patchExtractionBodySchema = z.object({
+  fields: z.record(z.string(), z.any()),
+});
+
+/**
+ * @param {unknown} raw
+ * @param {string} fieldType
+ */
+function coerceFieldValueForSchema(raw, fieldType) {
+  const t = (fieldType || "string").toLowerCase();
+  if (raw === null || raw === undefined) return null;
+  if (t === "number") {
+    if (typeof raw === "number" && Number.isFinite(raw)) return raw;
+    if (typeof raw === "string") {
+      const s = raw.trim().replace(/\s/g, "").replace(/\./g, "").replace(",", ".");
+      if (s === "") return null;
+      const n = Number.parseFloat(s);
+      return Number.isFinite(n) ? n : null;
+    }
+    return null;
+  }
+  if (t === "boolean") {
+    if (typeof raw === "boolean") return raw;
+    if (raw === true || raw === false) return raw;
+    const s = String(raw).trim().toLowerCase();
+    if (["true", "1", "si", "sí", "yes"].includes(s)) return true;
+    if (["false", "0", "no"].includes(s)) return false;
+    return Boolean(raw);
+  }
+  if (t === "array" || t === "object") {
+    if (typeof raw === "string") {
+      const u = raw.trim();
+      if (!u) return t === "array" ? [] : {};
+      try {
+        return JSON.parse(u);
+      } catch {
+        throw new HttpError(400, `JSON inválido para el campo (${t})`);
+      }
+    }
+    return raw;
+  }
+  if (typeof raw === "string") return raw;
+  return String(raw);
+}
+
+/**
+ * Actualiza valores en extractionJson respetando formato plano o `fields.*` rich.
+ *
+ * @param {Record<string, unknown>} extraction
+ * @param {string} key
+ * @param {unknown} value
+ */
+function setExtractionKey(extraction, key, value) {
+  const fields = extraction.fields;
+  if (fields && typeof fields === "object" && Object.prototype.hasOwnProperty.call(fields, key)) {
+    const cell = fields[key];
+    if (
+      cell &&
+      typeof cell === "object" &&
+      !Array.isArray(cell) &&
+      Object.prototype.hasOwnProperty.call(cell, "value")
+    ) {
+      fields[key] = { ...cell, value };
+    } else {
+      fields[key] = value;
+    }
+  } else if (fields && typeof fields === "object") {
+    fields[key] = value;
+  } else {
+    extraction[key] = value;
+  }
+}
+
+/**
+ * @param {string} userId
+ * @param {string} workspaceId
+ * @param {string} documentId
+ * @param {unknown} body
+ */
+async function patchDocumentExtraction(userId, workspaceId, documentId, body) {
+  const parsed = patchExtractionBodySchema.safeParse(body || {});
+  if (!parsed.success) throw new HttpError(400, "Body inválido");
+
+  const doc = await prisma.documentRecord.findFirst({
+    where: { id: documentId, workspaceId },
+    include: { documentType: true },
+  });
+  if (!doc) throw new HttpError(404, "Document not found");
+  if (!doc.documentType) throw new HttpError(400, "El documento no tiene tipo documental");
+
+  const schemaNorm = normalizeAiExtractionSchema(doc.documentType.aiExtractionSchema);
+  const allowed = new Map(schemaNorm.fields.map((f) => [f.key, f]));
+  const incoming = parsed.data.fields;
+  const keys = Object.keys(incoming);
+  if (keys.length === 0) throw new HttpError(400, "Sin campos para actualizar");
+  if (keys.length > 80) throw new HttpError(400, "Demasiados campos");
+
+  const extraction =
+    doc.extractionJson && typeof doc.extractionJson === "object" && !Array.isArray(doc.extractionJson)
+      ? JSON.parse(JSON.stringify(doc.extractionJson))
+      : {};
+
+  for (const key of keys) {
+    const spec = allowed.get(key);
+    if (!spec) {
+      throw new HttpError(400, `Clave no definida en el esquema del tipo: ${key}`);
+    }
+    let coerced;
+    try {
+      coerced = coerceFieldValueForSchema(incoming[key], spec.type);
+    } catch (e) {
+      if (e instanceof HttpError) throw e;
+      throw new HttpError(400, String(e));
+    }
+    setExtractionKey(extraction, key, coerced);
+  }
+
+  const updated = await prisma.documentRecord.update({
+    where: { id: doc.id },
+    data: {
+      extractionJson: extraction,
+      updatedAt: new Date(),
+    },
+    include: {
+      documentType: true,
+      emailMessage: true,
+      approvalRequests: {
+        orderBy: { createdAt: "desc" },
+        include: {
+          assignee: { select: { id: true, email: true, fullName: true } },
+        },
+      },
+    },
+  });
+
+  return updated;
+}
+
+/**
+ * Overrides para ERP (`bcStagingJson`): mismas claves que la extracción IA.
+ *
+ * @param {string} userId
+ * @param {string} workspaceId
+ * @param {string} documentId
+ * @param {unknown} body
+ */
+async function patchDocumentBcStaging(userId, workspaceId, documentId, body) {
+  const parsed = patchExtractionBodySchema.safeParse(body || {});
+  if (!parsed.success) throw new HttpError(400, "Body inválido");
+
+  const doc = await prisma.documentRecord.findFirst({
+    where: { id: documentId, workspaceId },
+    include: { documentType: true },
+  });
+  if (!doc) throw new HttpError(404, "Document not found");
+  if (!doc.documentType) throw new HttpError(400, "El documento no tiene tipo documental");
+
+  const schemaNorm = normalizeAiExtractionSchema(doc.documentType.aiExtractionSchema);
+  const allowed = new Map(schemaNorm.fields.map((f) => [f.key, f]));
+  const incoming = parsed.data.fields;
+  const keys = Object.keys(incoming);
+  if (keys.length === 0) throw new HttpError(400, "Sin campos para actualizar");
+  if (keys.length > 80) throw new HttpError(400, "Demasiados campos");
+
+  const staging =
+    doc.bcStagingJson &&
+    typeof doc.bcStagingJson === "object" &&
+    !Array.isArray(doc.bcStagingJson)
+      ? JSON.parse(JSON.stringify(doc.bcStagingJson))
+      : {};
+
+  for (const key of keys) {
+    const spec = allowed.get(key);
+    if (!spec) {
+      throw new HttpError(400, `Clave no definida en el esquema del tipo: ${key}`);
+    }
+    let coerced;
+    try {
+      coerced = coerceFieldValueForSchema(incoming[key], spec.type);
+    } catch (e) {
+      if (e instanceof HttpError) throw e;
+      throw new HttpError(400, String(e));
+    }
+    setExtractionKey(staging, key, coerced);
+  }
+
+  const updated = await prisma.documentRecord.update({
+    where: { id: doc.id },
+    data: {
+      bcStagingJson: staging,
+      updatedAt: new Date(),
+    },
+    include: {
+      documentType: true,
+      emailMessage: true,
+      approvalRequests: {
+        orderBy: { createdAt: "desc" },
+        include: {
+          assignee: { select: { id: true, email: true, fullName: true } },
+        },
+      },
+    },
+  });
+
+  return updated;
 }
 
 module.exports = {
@@ -357,5 +612,7 @@ module.exports = {
   getDocumentFileBuffer,
   getDocumentLayout,
   archiveDocumentToSharePoint,
+  patchDocumentExtraction,
+  patchDocumentBcStaging,
 };
 

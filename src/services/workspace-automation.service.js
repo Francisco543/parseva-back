@@ -1,6 +1,7 @@
 /**
  * @file Configuración de automatización del workspace
- * (SharePoint integration por defecto, plantilla de ruta, modelo OpenAI, flags).
+ * (integración de archivado: SharePoint, S3, Azure Blob; plantilla de ruta, modelo OpenAI).
+ *
  * @module services/workspace-automation
  */
 
@@ -9,10 +10,14 @@ const { z } = require("zod");
 const prisma = require("../lib/prisma");
 const HttpError = require("../utils/http-error");
 const { INTEGRATION_KIND, INTEGRATION_STATUS } = require("../constants/integration");
+const { isS3ConfigReady } = require("./object-storage-s3.service");
+const { isAzureBlobConfigReady } = require("./object-storage-azure.service");
+const { assertArchiveIntegration } = require("./document-archive-storage.service");
 
 /**
  * @typedef {object} AutomationSettings
- * @property {string|null} sharepointIntegrationId
+ * @property {string|null} sharepointIntegrationId Legacy; sincronizado con storage cuando es SP.
+ * @property {string|null} storageIntegrationId Integración usada para archivar PDFs (SP | S3 | Azure Blob).
  * @property {string} pathTemplate
  * @property {string} rootFolder
  * @property {boolean} extractionEnabled
@@ -21,6 +26,7 @@ const { INTEGRATION_KIND, INTEGRATION_STATUS } = require("../constants/integrati
 
 const automationSchema = z.object({
   sharepointIntegrationId: z.string().min(1).nullable().optional(),
+  storageIntegrationId: z.string().min(1).nullable().optional(),
   pathTemplate: z.string().max(500).optional().default("/{year}/{month}/{vendor_slug}"),
   rootFolder: z.string().max(200).optional().default(""),
   extractionEnabled: z.boolean().optional().default(true),
@@ -30,6 +36,7 @@ const automationSchema = z.object({
 /** @type {AutomationSettings} */
 const defaultSettings = {
   sharepointIntegrationId: null,
+  storageIntegrationId: null,
   pathTemplate: "/{year}/{month}/{vendor_slug}",
   rootFolder: "",
   extractionEnabled: true,
@@ -44,17 +51,27 @@ const defaultSettings = {
  */
 function coerceSettings(value) {
   if (!value || typeof value !== "object") return { ...defaultSettings };
-  return { ...defaultSettings, ...value };
+  const merged = { ...defaultSettings, ...value };
+  if (!merged.storageIntegrationId && merged.sharepointIntegrationId) {
+    merged.storageIntegrationId = merged.sharepointIntegrationId;
+  }
+  return merged;
+}
+
+/**
+ * Id efectivo de integración para archivar (prioriza `storageIntegrationId`).
+ *
+ * @param {unknown} automationSettingsRaw
+ * @returns {string|null}
+ */
+function getArchiveIntegrationId(automationSettingsRaw) {
+  const s = coerceSettings(automationSettingsRaw);
+  return s.storageIntegrationId || s.sharepointIntegrationId || null;
 }
 
 /**
  * Resuelve una integración SharePoint por defecto para el workspace cuando
- * todavía no hay `sharepointIntegrationId` configurado explícitamente.
- *
- * Reglas:
- *  - Solo toma integraciones `CONNECTED`.
- *  - Prioriza una integración con `driveId` configurado.
- *  - Si no hay ninguna válida, devuelve `null`.
+ * todavía no hay id configurado explícitamente.
  *
  * @param {string} workspaceId
  * @returns {Promise<string|null>}
@@ -77,6 +94,45 @@ async function resolveDefaultSharepointIntegrationId(workspaceId) {
 }
 
 /**
+ * Resuelve integración de archivado por defecto: SharePoint válido, luego S3, luego Azure Blob.
+ *
+ * @param {string} workspaceId
+ * @returns {Promise<string|null>}
+ */
+async function resolveDefaultArchiveIntegrationId(workspaceId) {
+  const sp = await resolveDefaultSharepointIntegrationId(workspaceId);
+  if (sp) return sp;
+
+  const s3rows = await prisma.integrationConnection.findMany({
+    where: {
+      workspaceId,
+      kind: INTEGRATION_KIND.S3,
+      status: INTEGRATION_STATUS.CONNECTED,
+    },
+    orderBy: { updatedAt: "desc" },
+  });
+  for (const row of s3rows) {
+    const cfg = row.configJson && typeof row.configJson === "object" ? row.configJson : {};
+    if (isS3ConfigReady(cfg)) return row.id;
+  }
+
+  const azRows = await prisma.integrationConnection.findMany({
+    where: {
+      workspaceId,
+      kind: INTEGRATION_KIND.AZURE_BLOB,
+      status: INTEGRATION_STATUS.CONNECTED,
+    },
+    orderBy: { updatedAt: "desc" },
+  });
+  for (const row of azRows) {
+    const cfg = row.configJson && typeof row.configJson === "object" ? row.configJson : {};
+    if (isAzureBlobConfigReady(cfg)) return row.id;
+  }
+
+  return null;
+}
+
+/**
  * Devuelve la configuración de automatización del workspace.
  *
  * @param {string} workspaceId
@@ -90,18 +146,30 @@ async function getAutomationSettings(workspaceId) {
   });
   if (!workspace) throw new HttpError(404, "Workspace not found");
 
-  const settings = coerceSettings(workspace.automationSettings);
-  if (settings.sharepointIntegrationId) return settings;
+  let settings = coerceSettings(workspace.automationSettings);
+  const effectiveId = settings.storageIntegrationId || settings.sharepointIntegrationId;
+  if (effectiveId) return settings;
 
-  const fallbackSharePointId = await resolveDefaultSharepointIntegrationId(workspaceId);
-  if (!fallbackSharePointId) return settings;
+  const fallbackId = await resolveDefaultArchiveIntegrationId(workspaceId);
+  if (!fallbackId) return settings;
 
-  // Autocompleta y persiste para evitar que futuros jobs queden sin archivado.
-  const next = { ...settings, sharepointIntegrationId: fallbackSharePointId };
+  const integ = await prisma.integrationConnection.findFirst({
+    where: { id: fallbackId, workspaceId },
+  });
+
+  const next = {
+    ...settings,
+    storageIntegrationId: fallbackId,
+  };
+  if (integ?.kind === INTEGRATION_KIND.SHAREPOINT) {
+    next.sharepointIntegrationId = fallbackId;
+  }
+
   await prisma.workspace.update({
     where: { id: workspaceId },
     data: { automationSettings: next },
   });
+
   return next;
 }
 
@@ -111,8 +179,6 @@ async function getAutomationSettings(workspaceId) {
  * @param {string} workspaceId
  * @param {Partial<AutomationSettings>} payload
  * @returns {Promise<AutomationSettings>}
- * @throws {HttpError} 400 si el payload es inválido o el SharePoint integration no pertenece al workspace.
- * @throws {HttpError} 404 si el workspace no existe.
  */
 async function updateAutomationSettings(workspaceId, payload) {
   const parsed = automationSchema.safeParse(payload || {});
@@ -124,18 +190,24 @@ async function updateAutomationSettings(workspaceId, payload) {
   if (!workspace) throw new HttpError(404, "Workspace not found");
 
   const current = coerceSettings(workspace.automationSettings);
+  /** @type {Record<string, unknown>} */
   const next = { ...current, ...parsed.data };
 
-  if (next.sharepointIntegrationId) {
-    const sp = await prisma.integrationConnection.findFirst({
-      where: {
-        id: next.sharepointIntegrationId,
-        workspaceId,
-        kind: INTEGRATION_KIND.SHAREPOINT,
-      },
+  if (
+    parsed.data.sharepointIntegrationId !== undefined &&
+    parsed.data.storageIntegrationId === undefined
+  ) {
+    next.storageIntegrationId = parsed.data.sharepointIntegrationId ?? next.storageIntegrationId;
+  }
+
+  const archiveId = next.storageIntegrationId || next.sharepointIntegrationId;
+  if (archiveId) {
+    await assertArchiveIntegration(workspaceId, archiveId);
+    const integ = await prisma.integrationConnection.findFirst({
+      where: { id: archiveId, workspaceId },
     });
-    if (!sp) {
-      throw new HttpError(400, "Integracion SharePoint no encontrada en este workspace");
+    if (integ?.kind === INTEGRATION_KIND.SHAREPOINT) {
+      next.sharepointIntegrationId = archiveId;
     }
   }
 
@@ -144,7 +216,7 @@ async function updateAutomationSettings(workspaceId, payload) {
     data: { automationSettings: next },
   });
 
-  return next;
+  return coerceSettings(next);
 }
 
 module.exports = {
@@ -152,4 +224,6 @@ module.exports = {
   updateAutomationSettings,
   coerceSettings,
   defaultSettings,
+  getArchiveIntegrationId,
+  resolveDefaultArchiveIntegrationId,
 };

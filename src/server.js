@@ -20,6 +20,7 @@ const { startEmailWorker } = require("./workers/email-worker");
 const {
   startGraphRenewalWorker,
   stopGraphRenewalWorker,
+  renewExpiringSubscriptions,
 } = require("./workers/graph-subscription-renewal.worker");
 const { startBcSyncWorker, stopBcSyncWorker } = require("./workers/bc-sync-worker");
 
@@ -45,7 +46,20 @@ startEmailWorker().catch((error) => {
   );
 });
 
-startGraphRenewalWorker();
+if (env.graphRenewWorkerEnabled) {
+  startGraphRenewalWorker();
+  setImmediate(() => {
+    renewExpiringSubscriptions().catch((err) => {
+      logger.error(
+        {
+          component: "graph-renewal",
+          err: err instanceof Error ? err.message : String(err),
+        },
+        "primer ciclo de renovación Graph falló"
+      );
+    });
+  });
+}
 startBcSyncWorker();
 
 /**

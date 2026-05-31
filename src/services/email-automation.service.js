@@ -34,11 +34,16 @@ const {
 const {
   buildStoragePath,
   safeFileName,
-  uploadDriveItem,
   slugify,
 } = require("./sharepoint.service");
 
-const { coerceSettings } = require("./workspace-automation.service");
+const { coerceSettings, getArchiveIntegrationId } = require("./workspace-automation.service");
+const { ensureWorkspaceDefaultDocumentTypes } = require("./document-type.service");
+const {
+  archiveUploadFromIntegration,
+  isIntegrationReadyForArchive,
+} = require("./document-archive-storage.service");
+const { INTEGRATION_KIND } = require("../constants/integration");
 const { createAuditEvent } = require("./audit.service");
 
 function isRetryableJobError(err) {
@@ -106,7 +111,7 @@ async function ingestEmailEvent(userId, workspaceId, payload) {
 
   const integration = await prisma.integrationConnection.findFirst({
 
-    where: { id: data.integrationId, userId, workspaceId, kind: "email" },
+    where: { id: data.integrationId, workspaceId, kind: "email" },
 
   });
 
@@ -477,26 +482,14 @@ async function processEmailJob({ jobId, emailMessageId }) {
 
     }
 
-    // Document types configurables por workspace. Si no hay ninguno, seed básico.
-    let docTypes = await prisma.documentType.findMany({
+    // Catalogo base BC por workspace (idempotente) + tipos configurables.
+    if (email.workspaceId) {
+      await ensureWorkspaceDefaultDocumentTypes(email.workspaceId);
+    }
+    const docTypes = await prisma.documentType.findMany({
       where: { workspaceId: email.workspaceId || undefined },
       orderBy: { createdAt: "asc" },
     });
-
-    if ((email.workspaceId && docTypes.length === 0)) {
-      await prisma.documentType.createMany({
-        data: [
-          { workspaceId: email.workspaceId, key: "invoice", displayName: "Facturas", enabled: true, requireApprovalBeforeErp: true },
-          { workspaceId: email.workspaceId, key: "delivery_note", displayName: "Remitos", enabled: true, requireApprovalBeforeErp: true },
-          { workspaceId: email.workspaceId, key: "purchase_order", displayName: "Órdenes de compra", enabled: true, requireApprovalBeforeErp: true },
-          { workspaceId: email.workspaceId, key: "other", displayName: "Otros", enabled: true, requireApprovalBeforeErp: true },
-        ],
-      });
-      docTypes = await prisma.documentType.findMany({
-        where: { workspaceId: email.workspaceId },
-        orderBy: { createdAt: "asc" },
-      });
-    }
 
     const enabledTypeKeys = docTypes.filter((t) => t.enabled).map((t) => t.key);
     const documentTypesForClassifier = docTypes
@@ -977,24 +970,22 @@ async function processEmailJob({ jobId, emailMessageId }) {
       },
     });
 
-    // DocumentRecord: el primer intento de SP va antes de la extraccion global (sin proveedor).
-    // Reintenta aqui los que sigan sin URL para tipos "invoice" usando vendor/fecha/numero ya extraidos.
-    if (settings.sharepointIntegrationId && email.workspaceId && pdfAttachments?.length) {
-      const spDeferred = await prisma.integrationConnection.findFirst({
+    // DocumentRecord: el primer intento de archivado va antes de la extracción global (sin proveedor).
+    // Reintenta aquí los que sigan sin URL usando vendor/fecha/número ya extraídos (SharePoint, S3 o Azure Blob).
+    const archiveIntegrationPostEx = getArchiveIntegrationId(settings);
+    if (archiveIntegrationPostEx && email.workspaceId && pdfAttachments?.length) {
+      const integDeferred = await prisma.integrationConnection.findFirst({
         where: {
-          id: settings.sharepointIntegrationId,
+          id: archiveIntegrationPostEx,
           workspaceId: email.workspaceId,
-          kind: "sharepoint",
         },
       });
-      const cfgDef =
-        spDeferred?.configJson && typeof spDeferred.configJson === "object" ? spDeferred.configJson : {};
-      if (cfgDef.driveId) {
+      if (integDeferred && isIntegrationReadyForArchive(integDeferred)) {
         const pendingDocs = await prisma.documentRecord.findMany({
           where: {
             emailMessageId: email.id,
             workspaceId: email.workspaceId,
-            sharepointWebUrl: null,
+            status: { not: "ARCHIVED" },
           },
         });
         for (const dRow of pendingDocs) {
@@ -1053,50 +1044,54 @@ async function processEmailJob({ jobId, emailMessageId }) {
             );
             const baseDef = `${slugify(typeKeyDef || "documento")}_${dRow.sha256.slice(0, 10)}`;
             const relativeDef = `${folderDef}/${safeFileName(baseDef)}`;
-            const uploadedDef = await uploadDriveItem(
-              workspace.aadTenantId,
-              cfgDef.driveId,
-              relativeDef,
-              att.buffer,
-              att.contentType
-            );
+            const uploadDataDef = await archiveUploadFromIntegration({
+              tenantId: workspace.aadTenantId,
+              integration: integDeferred,
+              integrationId: integDeferred.id,
+              relativePath: relativeDef,
+              buffer: att.buffer,
+              contentType: att.contentType,
+            });
             await prisma.documentRecord.update({
               where: { id: dRow.id },
-              data: {
-                status: "ARCHIVED",
-                sharepointSiteId: cfgDef.siteId || null,
-                sharepointDriveId: cfgDef.driveId,
-                sharepointItemId: uploadedDef?.id || null,
-                sharepointWebUrl: uploadedDef?.webUrl || null,
-                sharepointPath: relativeDef,
-                lastError: null,
-              },
+              data: uploadDataDef,
             });
             await createAuditEvent({
-              action: "document.archived.sharepoint",
+              action:
+                integDeferred.kind === INTEGRATION_KIND.SHAREPOINT
+                  ? "document.archived.sharepoint"
+                  : "document.archived.storage",
               userId: email.userId,
               workspaceId: email.workspaceId,
               entityType: "DocumentRecord",
               entityId: dRow.id,
               metadata: {
                 sharepointPath: relativeDef,
-                webUrl: uploadedDef?.webUrl || null,
+                webUrl: uploadDataDef.sharepointWebUrl || null,
                 phase: "post_extraction",
+                storageKind: integDeferred.kind,
               },
             });
           } catch (errDef) {
             const msgDef = errDef instanceof Error ? errDef.message : String(errDef);
             await prisma.documentRecord.update({
               where: { id: dRow.id },
-              data: { lastError: `SharePoint: ${msgDef}` },
+              data: { lastError: `${integDeferred.kind}: ${msgDef}` },
             });
             await createAuditEvent({
-              action: "document.archive_failed.sharepoint",
+              action:
+                integDeferred.kind === INTEGRATION_KIND.SHAREPOINT
+                  ? "document.archive_failed.sharepoint"
+                  : "document.archive_failed.storage",
               userId: email.userId,
               workspaceId: email.workspaceId,
               entityType: "DocumentRecord",
               entityId: dRow.id,
-              metadata: { error: msgDef, phase: "post_extraction" },
+              metadata: {
+                error: msgDef,
+                phase: "post_extraction",
+                storageKind: integDeferred.kind,
+              },
             });
           }
         }
@@ -1200,6 +1195,38 @@ async function processEmailJob({ jobId, emailMessageId }) {
           },
         });
 
+        if (
+          nextStatus === "NEEDS_APPROVAL" &&
+          email.workspaceId &&
+          docRow.documentTypeId
+        ) {
+          try {
+            const { ensurePendingApprovalRequest } = require("./approval-routing.service");
+            await ensurePendingApprovalRequest({
+              documentId: docRow.id,
+              workspaceId: email.workspaceId,
+              documentTypeId: docRow.documentTypeId,
+              extractionJson: mergedExtraction,
+              documentConfidence: conf,
+            });
+          } catch {
+            /* enrutado opcional; no bloquear ingesta */
+          }
+        }
+
+        if (nextStatus === "NEEDS_REVIEW") {
+          try {
+            const { dispatchOutgoingWebhooks } = require("./webhook-outbound.service");
+            dispatchOutgoingWebhooks(email.workspaceId, "document.needs_review", {
+              documentId: docRow.id,
+              status: nextStatus,
+              validationErrors: valErrors,
+            });
+          } catch {
+            /* opcional */
+          }
+        }
+
         if (pol.matchingPolicy.semanticMatch.enabled) {
           try {
             await ensureDocumentEmbedded(email.workspaceId, docRow.id);
@@ -1240,18 +1267,17 @@ async function processEmailJob({ jobId, emailMessageId }) {
 
     let jobNote = null;
 
-    // Si ya existe un DocumentRecord archivado en SharePoint con el mismo SHA256
-    // del PDF primario (mismo email, mismo workspace), reutilizamos ese archivo
-    // en lugar de re-subirlo. Esto evita duplicar el mismo PDF en dos rutas
-    // distintas (carpeta del tipo + carpeta base del workspace).
-    if (settings.sharepointIntegrationId && primaryPdf?.buffer && email.workspaceId) {
+    // Si ya existe un DocumentRecord archivado con el mismo SHA256 del PDF primario
+    // (mismo email, mismo workspace), reutilizamos ese archivo en lugar de re-subirlo.
+    const archiveIntegrationInvoice = getArchiveIntegrationId(settings);
+    if (archiveIntegrationInvoice && primaryPdf?.buffer && email.workspaceId) {
       const primarySha = crypto.createHash("sha256").update(primaryPdf.buffer).digest("hex");
       const archivedDoc = await prisma.documentRecord.findFirst({
         where: {
           workspaceId: email.workspaceId,
           emailMessageId: email.id,
           sha256: primarySha,
-          NOT: { sharepointWebUrl: null },
+          status: "ARCHIVED",
         },
         select: {
           id: true,
@@ -1261,6 +1287,9 @@ async function processEmailJob({ jobId, emailMessageId }) {
           sharepointWebUrl: true,
           sharepointPath: true,
           fileName: true,
+          archiveIntegrationId: true,
+          archiveStorageKind: true,
+          archiveStorageExtra: true,
         },
       });
 
@@ -1275,12 +1304,19 @@ async function processEmailJob({ jobId, emailMessageId }) {
             sharepointWebUrl: archivedDoc.sharepointWebUrl,
             sharepointPath: archivedDoc.sharepointPath,
             fileName: archivedDoc.fileName || invoiceRecord.fileName,
+            archiveIntegrationId: archivedDoc.archiveIntegrationId,
+            archiveStorageKind: archivedDoc.archiveStorageKind,
+            archiveStorageExtra: archivedDoc.archiveStorageExtra,
             lastError: null,
           },
         });
 
+        const invReuseKind = archivedDoc.archiveStorageKind || INTEGRATION_KIND.SHAREPOINT;
         await createAuditEvent({
-          action: "invoice.archived.sharepoint",
+          action:
+            invReuseKind === INTEGRATION_KIND.SHAREPOINT
+              ? "invoice.archived.sharepoint"
+              : "invoice.archived.storage",
           userId: email.userId,
           workspaceId: email.workspaceId,
           entityType: "InvoiceRecord",
@@ -1290,138 +1326,88 @@ async function processEmailJob({ jobId, emailMessageId }) {
             sharepointPath: invoiceRecord.sharepointPath,
             fileName: invoiceRecord.fileName,
             reusedFromDocumentRecord: archivedDoc.id,
+            storageKind: invReuseKind,
           },
         });
       }
     }
 
-    // Fallback: si no hay DocumentRecord archivado (p. ej. workspaces sin
-    // tipos documentales o sin clasificación), conservamos el flujo legacy de
-    // subida directa para el InvoiceRecord usando la plantilla por defecto.
+    // Fallback: sin DocumentRecord archivado — subida directa al InvoiceRecord (plantilla por defecto).
+    const archiveIntegrationFallback = getArchiveIntegrationId(settings);
     if (
-      settings.sharepointIntegrationId &&
+      archiveIntegrationFallback &&
       primaryPdf?.buffer &&
+      email.workspaceId &&
       invoiceRecord.status !== "ARCHIVED"
     ) {
-
-      const sp = await prisma.integrationConnection.findFirst({
-
+      const storageInteg = await prisma.integrationConnection.findFirst({
         where: {
-
-          id: settings.sharepointIntegrationId,
-
+          id: archiveIntegrationFallback,
           workspaceId: email.workspaceId,
-
-          kind: "sharepoint",
-
         },
-
       });
 
-      const cfg =
-
-        sp?.configJson && typeof sp.configJson === "object"
-
-          ? sp.configJson
-
-          : {};
-
-
-
-      if (cfg.driveId) {
-
+      if (storageInteg && isIntegrationReadyForArchive(storageInteg)) {
         try {
-
           const folder = buildStoragePath(
-
             settings.pathTemplate,
-
             {
-
               vendorName,
-
               country: p.country,
-
               area: p.area,
-
               invoiceNumber: p.invoice_number,
-
               receivedAt: email.receivedAt,
-
               invoiceDate,
-
             },
-
             settings.rootFolder
-
           );
 
           const dateStr =
-
             typeof p.invoice_date === "string" && /^\d{4}-\d{2}-\d{2}/.test(p.invoice_date)
-
               ? p.invoice_date.slice(0, 10)
-
               : new Date(email.receivedAt).toISOString().slice(0, 10);
 
           const baseName = [
-
             slugify(vendorName || "proveedor"),
-
             dateStr,
-
             slugify(p.invoice_number || "") || invoiceRecord.id.slice(-8),
-
           ].join("_");
 
           const filename = safeFileName(baseName);
 
           const relative = `${folder}/${filename}`;
 
-          const uploaded = await uploadDriveItem(
-
-            workspace.aadTenantId,
-
-            cfg.driveId,
-
-            relative,
-
-            primaryPdf.buffer,
-
-            primaryPdf.contentType
-
-          );
-
-
+          const uploadInv = await archiveUploadFromIntegration({
+            tenantId: workspace.aadTenantId,
+            integration: storageInteg,
+            integrationId: storageInteg.id,
+            relativePath: relative,
+            buffer: primaryPdf.buffer,
+            contentType: primaryPdf.contentType,
+          });
 
           invoiceRecord = await prisma.invoiceRecord.update({
-
             where: { id: invoiceRecord.id },
-
             data: {
-
-              status: "ARCHIVED",
-
-              sharepointSiteId: cfg.siteId || null,
-
-              sharepointDriveId: cfg.driveId,
-
-              sharepointItemId: uploaded?.id || null,
-
-              sharepointWebUrl: uploaded?.webUrl || null,
-
-              sharepointPath: relative,
-
+              status: uploadInv.status,
+              sharepointSiteId: uploadInv.sharepointSiteId,
+              sharepointDriveId: uploadInv.sharepointDriveId,
+              sharepointItemId: uploadInv.sharepointItemId,
+              sharepointWebUrl: uploadInv.sharepointWebUrl,
+              sharepointPath: uploadInv.sharepointPath,
               fileName: filename,
-
-              lastError: null,
-
+              lastError: uploadInv.lastError,
+              archiveIntegrationId: uploadInv.archiveIntegrationId,
+              archiveStorageKind: uploadInv.archiveStorageKind,
+              archiveStorageExtra: uploadInv.archiveStorageExtra,
             },
-
           });
 
           await createAuditEvent({
-            action: "invoice.archived.sharepoint",
+            action:
+              storageInteg.kind === INTEGRATION_KIND.SHAREPOINT
+                ? "invoice.archived.sharepoint"
+                : "invoice.archived.storage",
             userId: email.userId,
             workspaceId: email.workspaceId,
             entityType: "InvoiceRecord",
@@ -1430,40 +1416,34 @@ async function processEmailJob({ jobId, emailMessageId }) {
               sharepointWebUrl: invoiceRecord.sharepointWebUrl,
               sharepointPath: invoiceRecord.sharepointPath,
               fileName: invoiceRecord.fileName,
+              storageKind: storageInteg.kind,
             },
           });
-
         } catch (err) {
-
           const msg = err instanceof Error ? err.message : String(err);
 
-          jobNote = `SharePoint: ${msg}`;
+          jobNote = `${storageInteg.kind}: ${msg}`;
 
           invoiceRecord = await prisma.invoiceRecord.update({
-
             where: { id: invoiceRecord.id },
-
             data: {
-
               lastError: jobNote,
-
             },
-
           });
 
           await createAuditEvent({
-            action: "invoice.archive_failed.sharepoint",
+            action:
+              storageInteg.kind === INTEGRATION_KIND.SHAREPOINT
+                ? "invoice.archive_failed.sharepoint"
+                : "invoice.archive_failed.storage",
             userId: email.userId,
             workspaceId: email.workspaceId,
             entityType: "InvoiceRecord",
             entityId: invoiceRecord.id,
-            metadata: { error: jobNote },
+            metadata: { error: jobNote, storageKind: storageInteg.kind },
           });
-
         }
-
       }
-
     }
 
 
@@ -1581,9 +1561,9 @@ async function processEmailJob({ jobId, emailMessageId }) {
 
 
 
-async function listEmailJobs(userId, workspaceId) {
+async function listEmailJobs(_userId, workspaceId) {
   return prisma.processingJob.findMany({
-    where: { userId, workspaceId, queueKey: "email-ingestion" },
+    where: { workspaceId, queueKey: "email-ingestion" },
     orderBy: { createdAt: "desc" },
     take: 50,
     include: {

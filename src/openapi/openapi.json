@@ -1,0 +1,54 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Parseva API",
+    "version": "1.0.0",
+    "description": "API REST (sesión cookie o API key). Ver README del backend para autenticación."
+  },
+  "servers": [{ "url": "/api" }],
+  "paths": {
+    "/health": {
+      "get": {
+        "summary": "Health check",
+        "responses": { "200": { "description": "OK" } }
+      }
+    },
+    "/documents": {
+      "get": {
+        "summary": "Listar documentos del workspace",
+        "parameters": [
+          { "name": "status", "in": "query", "schema": { "type": "string" } },
+          { "name": "type", "in": "query", "schema": { "type": "string" } },
+          { "name": "q", "in": "query", "schema": { "type": "string" } }
+        ],
+        "responses": { "200": { "description": "Lista de documentos" } }
+      }
+    },
+    "/documents/upload": {
+      "post": {
+        "summary": "Subida manual de PDFs (multipart)",
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "files": { "type": "array", "items": { "type": "string", "format": "binary" } },
+                  "documentTypeId": { "type": "string" }
+                }
+              }
+            }
+          }
+        },
+        "responses": { "201": { "description": "Resultados por archivo" } }
+      }
+    },
+    "/documents/{id}/reprocess": {
+      "post": {
+        "summary": "Reprocesar documento (requiere PDF en SharePoint)",
+        "parameters": [{ "name": "id", "in": "path", "required": true, "schema": { "type": "string" } }],
+        "responses": { "200": { "description": "Pipeline ejecutado" } }
+      }
+    }
+  }
+}

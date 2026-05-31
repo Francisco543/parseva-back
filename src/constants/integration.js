@@ -13,7 +13,18 @@ const INTEGRATION_KIND = Object.freeze({
   EMAIL: "email",
   SHAREPOINT: "sharepoint",
   BUSINESS_CENTRAL: "business_central",
+  /** Amazon S3 (bucket + credenciales en configJson). */
+  S3: "s3",
+  /** Azure Blob Storage (container + connection string o cuenta/clave). */
+  AZURE_BLOB: "azure_blob",
 });
+
+/** Integraciones que pueden usarse como destino de archivado de PDFs. */
+const ARCHIVE_STORAGE_KINDS = Object.freeze([
+  INTEGRATION_KIND.SHAREPOINT,
+  INTEGRATION_KIND.S3,
+  INTEGRATION_KIND.AZURE_BLOB,
+]);
 
 /** Lista de todos los tipos válidos (para validaciones con Zod, etc.). */
 const INTEGRATION_KIND_LIST = Object.freeze(Object.values(INTEGRATION_KIND));
@@ -42,6 +53,7 @@ const WORKSPACE_ROLE = Object.freeze({
 module.exports = {
   INTEGRATION_KIND,
   INTEGRATION_KIND_LIST,
+  ARCHIVE_STORAGE_KINDS,
   INTEGRATION_STATUS,
   WORKSPACE_ROLE,
 };

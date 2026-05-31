@@ -1,5 +1,5 @@
 /**
- * @file Cliente Kafka opcional para encolar jobs de procesamiento de emails.
+ * @file Cliente Kafka opcional: colas de email y de sync con Business Central.
  *
  * Si `KAFKA_ENABLED=false` (o no está configurado) este módulo se vuelve un
  * conjunto de funciones no-op: las publicaciones devuelven `false` y los consumers
@@ -10,6 +10,8 @@
  *  - `KAFKA_EMAIL_TOPIC`: cola principal de jobs de email.
  *  - `KAFKA_EMAIL_RETRY_TOPIC`: jobs con `notBefore` futuro a re-publicar.
  *  - `KAFKA_EMAIL_DLQ_TOPIC`: dead letter queue para jobs fallidos definitivos.
+ *  - `KAFKA_BC_SYNC_TOPIC`: un mensaje por `BcSyncEvent` pendiente de ingest BC.
+ *  - `KAFKA_BC_SYNC_DLQ_TOPIC`: fallos definitivos de sync BC (observabilidad).
  *
  * @module lib/kafka
  */
@@ -23,6 +25,8 @@ let producer;
 let mainConsumer;
 /** @type {import('kafkajs').Consumer | undefined} */
 let retryConsumer;
+/** @type {import('kafkajs').Consumer | undefined} */
+let bcSyncConsumer;
 /** @type {Kafka | undefined} */
 let kafkaClient;
 
@@ -127,6 +131,58 @@ async function publishEmailDlq(jobPayload) {
 }
 
 /**
+ * @typedef {object} BcSyncJobPayload
+ * @property {number} [v] Versión del esquema del mensaje (1).
+ * @property {string} eventId `BcSyncEvent.id`
+ * @property {string} workspaceId
+ * @property {string} [documentId]
+ * @property {string} [mappingProfileId]
+ */
+
+/**
+ * Publica un job de sync BC (despachado tras crear `BcSyncEvent` en PENDING).
+ *
+ * @param {BcSyncJobPayload} payload
+ * @returns {Promise<boolean>}
+ */
+async function publishBcSyncJob(payload) {
+  const activeProducer = await getProducer();
+  if (!activeProducer) return false;
+
+  const body = {
+    v: 1,
+    eventId: String(payload.eventId || "").trim(),
+    workspaceId: String(payload.workspaceId || "").trim(),
+    documentId: payload.documentId != null ? String(payload.documentId) : undefined,
+    mappingProfileId: payload.mappingProfileId != null ? String(payload.mappingProfileId) : undefined,
+  };
+  if (!body.eventId || !body.workspaceId) return false;
+
+  await activeProducer.send({
+    topic: env.kafkaBcSyncTopic,
+    messages: [{ key: body.eventId, value: JSON.stringify(body) }],
+  });
+  return true;
+}
+
+/**
+ * Dead letter: sync BC fallido sin más reintentos (o error de negocio).
+ *
+ * @param {Record<string, unknown>} payload
+ * @returns {Promise<boolean>}
+ */
+async function publishBcSyncDlq(payload) {
+  const activeProducer = await getProducer();
+  if (!activeProducer) return false;
+
+  await activeProducer.send({
+    topic: env.kafkaBcSyncDlqTopic,
+    messages: [{ value: JSON.stringify({ v: 1, ...payload }) }],
+  });
+  return true;
+}
+
+/**
  * Inicia el consumer del topic principal y delega cada mensaje en `onMessage`.
  * Es idempotente: si ya hay un consumer corriendo no hace nada.
  *
@@ -186,6 +242,48 @@ async function startEmailRetryConsumer() {
 }
 
 /**
+ * Consumer dedicado a sync BC (`KAFKA_BC_SYNC_TOPIC`).
+ *
+ * @param {(payload: BcSyncJobPayload) => Promise<void>} onMessage
+ * @returns {Promise<void>}
+ */
+async function startBcSyncConsumer(onMessage) {
+  if (!isKafkaEnabled()) return;
+  if (bcSyncConsumer) return;
+
+  bcSyncConsumer = getKafkaClient().consumer({ groupId: env.kafkaBcSyncGroupId });
+  await bcSyncConsumer.connect();
+  await bcSyncConsumer.subscribe({ topic: env.kafkaBcSyncTopic, fromBeginning: false });
+  await bcSyncConsumer.run({
+    eachMessage: async ({ message }) => {
+      if (!message.value) return;
+      const raw = JSON.parse(message.value.toString());
+      const eventId = String(raw?.eventId || "").trim();
+      const workspaceId = String(raw?.workspaceId || "").trim();
+      if (!eventId || !workspaceId) return;
+      await onMessage({
+        v: Number(raw?.v) || 1,
+        eventId,
+        workspaceId,
+        documentId: raw?.documentId != null ? String(raw.documentId) : undefined,
+        mappingProfileId: raw?.mappingProfileId != null ? String(raw.mappingProfileId) : undefined,
+      });
+    },
+  });
+}
+
+/**
+ * Detiene el consumer de sync BC (shutdown / deshabilitar worker).
+ *
+ * @returns {Promise<void>}
+ */
+async function stopBcSyncConsumer() {
+  if (!bcSyncConsumer) return;
+  await bcSyncConsumer.disconnect().catch(() => {});
+  bcSyncConsumer = undefined;
+}
+
+/**
  * Cierra ordenadamente producer y consumers de Kafka. Se utiliza durante el
  * shutdown del servidor. Es seguro llamarlo aunque Kafka esté deshabilitado.
  *
@@ -193,10 +291,12 @@ async function startEmailRetryConsumer() {
  */
 async function disconnectKafka() {
   const tasks = [];
+  if (bcSyncConsumer) tasks.push(bcSyncConsumer.disconnect().catch(() => {}));
   if (mainConsumer) tasks.push(mainConsumer.disconnect().catch(() => {}));
   if (retryConsumer) tasks.push(retryConsumer.disconnect().catch(() => {}));
   if (producer) tasks.push(producer.disconnect().catch(() => {}));
   await Promise.allSettled(tasks);
+  bcSyncConsumer = undefined;
   mainConsumer = undefined;
   retryConsumer = undefined;
   producer = undefined;
@@ -207,7 +307,11 @@ module.exports = {
   publishEmailJob,
   publishEmailRetry,
   publishEmailDlq,
+  publishBcSyncJob,
+  publishBcSyncDlq,
   startEmailConsumer,
   startEmailRetryConsumer,
+  startBcSyncConsumer,
+  stopBcSyncConsumer,
   disconnectKafka,
 };

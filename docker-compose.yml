@@ -10,8 +10,9 @@
 #   3. npx prisma migrate deploy
 #
 # Detalle: docker/README.md
-
-name: invoicely
+#
+# Nombre del proyecto: usar `docker-compose -p invoicely up -d` si quieres el prefijo "invoicely"
+# (Compose V2 admite `name:` en la raíz; docker-compose legado no).
 
 services:
   postgres:

@@ -24,6 +24,8 @@ const {
 const { createAuditEvent } = require("../services/audit.service");
 const { logger } = require("../lib/logger");
 const { AUDIT_ACTION } = require("../constants");
+const { PERMISSIONS } = require("../constants/rbac");
+const { requirePermission } = require("../middlewares/rbac.middleware");
 
 const router = express.Router();
 
@@ -73,6 +75,7 @@ router.post(
   "/email/graph/subscriptions",
   authenticateSession,
   requireWorkspaceContext,
+  requirePermission(PERMISSIONS.CONFIG_WRITE),
   asyncHandler(async (req, res) => {
     const subscription = await createGraphSubscription(
       req.dbUser.id,
@@ -102,6 +105,7 @@ router.get(
   "/email/graph/webhook-diagnostics",
   authenticateSession,
   requireWorkspaceContext,
+  requirePermission(PERMISSIONS.CONFIG_READ),
   asyncHandler(async (req, res) => {
     const report = await getWebhookDiagnostics(req.dbUser.id, req.workspace.id);
     res.json(report);
@@ -112,6 +116,7 @@ router.get(
   "/email/graph/diagnose-mailbox",
   authenticateSession,
   requireWorkspaceContext,
+  requirePermission(PERMISSIONS.CONFIG_READ),
   asyncHandler(async (req, res) => {
     const mailbox = String(req.query.mailbox || "").trim().toLowerCase();
     if (!mailbox) {

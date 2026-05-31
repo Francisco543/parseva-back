@@ -15,6 +15,9 @@ const env = require("../config/env");
 const { ingestEmailEvent } = require("./email-automation.service");
 const { logger } = require("../lib/logger");
 const { INTEGRATION_KIND, INTEGRATION_STATUS } = require("../constants");
+const {
+  OUTLOOK_MESSAGES_SUBSCRIPTION_MAX_MS,
+} = require("../constants/graph-subscription");
 
 const createSubscriptionSchema = z.object({
   integrationId: z.string().min(1),
@@ -101,7 +104,6 @@ async function createGraphSubscription(userId, workspaceId, payload) {
   const integration = await prisma.integrationConnection.findFirst({
     where: {
       id: parsed.data.integrationId,
-      userId,
       workspaceId,
       kind: INTEGRATION_KIND.EMAIL,
     },
@@ -116,7 +118,7 @@ async function createGraphSubscription(userId, workspaceId, payload) {
   if (!workspace) throw new HttpError(404, "Workspace not found");
 
   const previousSubs = await prisma.emailGraphSubscription.findMany({
-    where: { integrationId: integration.id, userId, workspaceId },
+    where: { integrationId: integration.id, workspaceId },
   });
 
   for (const prev of previousSubs) {
@@ -133,7 +135,7 @@ async function createGraphSubscription(userId, workspaceId, payload) {
   }
 
   const clientState = crypto.randomUUID();
-  const expiration = new Date(Date.now() + 60 * 60 * 1000);
+  const expiration = new Date(Date.now() + OUTLOOK_MESSAGES_SUBSCRIPTION_MAX_MS);
   const mailbox = parsed.data.mailbox;
 
   const resource = `/users/${mailbox}/messages`;
@@ -180,9 +182,9 @@ async function createGraphSubscription(userId, workspaceId, payload) {
   });
 }
 
-async function listGraphSubscriptions(userId, workspaceId) {
+async function listGraphSubscriptions(_userId, workspaceId) {
   return prisma.emailGraphSubscription.findMany({
-    where: { userId, workspaceId },
+    where: { workspaceId },
     include: {
       integration: true,
     },
@@ -320,13 +322,13 @@ function normalizeWebhookUrl(u) {
  * Compara la suscripcion guardada en Microsoft Graph con PUBLIC_API_BASE_URL actual.
  * Caso tipico: ngrok cambio de dominio y el .env no se actualizo / no se recreo la suscripcion.
  */
-async function getWebhookDiagnostics(userId, workspaceId) {
+async function getWebhookDiagnostics(_userId, workspaceId) {
   const expectedNotificationUrl = normalizeWebhookUrl(
     `${String(env.publicApiBaseUrl || "").replace(/\/+$/, "")}/email/graph/webhook`
   );
 
   const rows = await prisma.emailGraphSubscription.findMany({
-    where: { userId, workspaceId },
+    where: { workspaceId },
     include: { workspace: true, integration: true },
     orderBy: { createdAt: "desc" },
     take: 10,

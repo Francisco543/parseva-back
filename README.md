@@ -10,6 +10,12 @@ o en producción con un broker Kafka real.
 
 ---
 
+Levantar dockers:
+KAFKA:
+docker-compose -f docker-compose.yml -f docker-compose.kafka.yml up -d
+POSTGRESS:
+docker-compose -p invoicely up -d
+
 ## Tabla de contenidos
 
 - [Stack](#stack)
@@ -25,17 +31,17 @@ o en producción con un broker Kafka real.
 
 ## Stack
 
-| Área              | Librería                                         |
-| ----------------- | ------------------------------------------------ |
-| Framework HTTP    | `express` 5                                      |
-| Auth              | `@azure/msal-node` + cookies firmadas (JWT HS256)|
-| ORM               | `prisma` + `@prisma/adapter-pg`                  |
-| Validación        | `zod`                                            |
-| Observabilidad    | `pino` + `pino-http` + `morgan`                  |
-| Seguridad         | `helmet`, `express-rate-limit`, `cookie-parser`  |
-| Mensajería        | `kafkajs` (opcional)                             |
-| IA                | `openai` (Responses API + embeddings)            |
-| Documentos        | `pdf-parse`                                      |
+| Área           | Librería                                          |
+| -------------- | ------------------------------------------------- |
+| Framework HTTP | `express` 5                                       |
+| Auth           | `@azure/msal-node` + cookies firmadas (JWT HS256) |
+| ORM            | `prisma` + `@prisma/adapter-pg`                   |
+| Validación     | `zod`                                             |
+| Observabilidad | `pino` + `pino-http` + `morgan`                   |
+| Seguridad      | `helmet`, `express-rate-limit`, `cookie-parser`   |
+| Mensajería     | `kafkajs` (opcional)                              |
+| IA             | `openai` (Responses API + embeddings)             |
+| Documentos     | `pdf-parse`                                       |
 
 ---
 
@@ -49,14 +55,14 @@ npm run prisma:push          # primera vez en local
 npm run dev                  # nodemon + .env
 ```
 
-| Script                | Descripción                              |
-| --------------------- | ---------------------------------------- |
-| `npm run dev`         | Levanta el server con `nodemon`.         |
-| `npm start`           | Producción (`node src/server.js`).       |
-| `npm run prisma:generate` | Regenera el cliente Prisma.          |
-| `npm run prisma:push` | Sincroniza schema con la BD (sin migr.). |
-| `npm run prisma:migrate` | Crea/aplica migraciones.              |
-| `npm run prisma:studio` | Abre Prisma Studio.                    |
+| Script                    | Descripción                              |
+| ------------------------- | ---------------------------------------- |
+| `npm run dev`             | Levanta el server con `nodemon`.         |
+| `npm start`               | Producción (`node src/server.js`).       |
+| `npm run prisma:generate` | Regenera el cliente Prisma.              |
+| `npm run prisma:push`     | Sincroniza schema con la BD (sin migr.). |
+| `npm run prisma:migrate`  | Crea/aplica migraciones.                 |
+| `npm run prisma:studio`   | Abre Prisma Studio.                      |
 
 ---
 
@@ -114,20 +120,23 @@ Todas las envs se validan en `src/config/env.js`. Valores faltantes o fuera de
 rango hacen que el proceso falle al arrancar (fail-fast). Ver `.env.example`
 para la lista completa con descripciones; las más relevantes:
 
-| Variable                    | Default                         | Descripción                                |
-| --------------------------- | ------------------------------- | ------------------------------------------ |
-| `PORT`                      | `4000`                          | Puerto HTTP.                               |
-| `NODE_ENV`                  | `development`                   | `development` / `test` / `production`.     |
-| `MSAL_TENANT_ID`            | —                               | Tenant para login (puede ser `common`).    |
-| `MSAL_CLIENT_ID/SECRET`     | —                               | App registration de Azure AD.              |
-| `SESSION_SECRET`            | —                               | Min. 16 chars; firma cookies de sesión.    |
-| `FRONTEND_ORIGIN`           | `http://localhost:3000`         | CORS allowlist + post-login redirect.      |
-| `DATABASE_URL`              | —                               | Connection string de Postgres.             |
-| `KAFKA_ENABLED`             | `false`                         | Habilita publicación en Kafka.             |
-| `OPENAI_API_KEY`            | (vacío)                         | Sin clave se cae al stub determinista.     |
-| `OPENAI_MODEL`              | `gpt-4o-mini`                   | Modelo de chat por defecto.                |
-| `OPENAI_EMBEDDING_DIMS`     | `1536`                          | Debe coincidir con el `vector(N)` en BD.   |
-| `FLOW_WORKER_ENABLED`       | `true`                          | Toggle del worker de sync BC.              |
+| Variable                | Default                 | Descripción                              |
+| ----------------------- | ----------------------- | ---------------------------------------- |
+| `PORT`                  | `4000`                  | Puerto HTTP.                             |
+| `NODE_ENV`              | `development`           | `development` / `test` / `production`.   |
+| `MSAL_TENANT_ID`        | —                       | Tenant para login (puede ser `common`).  |
+| `MSAL_CLIENT_ID/SECRET` | —                       | App registration de Azure AD.            |
+| `SESSION_SECRET`        | —                       | Min. 16 chars; firma cookies de sesión.  |
+| `FRONTEND_ORIGIN`       | `http://localhost:3000` | CORS allowlist + post-login redirect.    |
+| `DATABASE_URL`          | —                       | Connection string de Postgres.           |
+| `KAFKA_ENABLED`         | `false`                 | Habilita publicación en Kafka.           |
+| `OPENAI_API_KEY`        | (vacío)                 | Sin clave se cae al stub determinista.   |
+| `OPENAI_MODEL`          | `gpt-4o-mini`           | Modelo de chat por defecto.              |
+| `OPENAI_EMBEDDING_DIMS` | `1536`                  | Debe coincidir con el `vector(N)` en BD. |
+| `FLOW_WORKER_ENABLED`   | `true`                  | Toggle del worker de sync BC.            |
+
+Para el flujo SaaS de consentimiento Microsoft 365 / Business Central, ver
+[`docs/microsoft-saas-connectors.md`](docs/microsoft-saas-connectors.md).
 
 ---
 
@@ -146,11 +155,11 @@ para la lista completa con descripciones; las más relevantes:
 
 Tres procesos se arrancan junto con el server (todos cancelables en shutdown):
 
-| Worker                  | Trigger              | Qué hace                                                                  |
-| ----------------------- | -------------------- | ------------------------------------------------------------------------- |
-| `email-worker`          | Inline o Kafka       | Procesa los `EmailJob` (extracción, matching, persistencia).              |
-| `graph-subscription-renewal.worker` | Interval cada `GRAPH_RENEW_INTERVAL_MS` | Renueva suscripciones de Graph antes del expiry.            |
-| `bc-sync-worker`        | Polling DB           | Despacha eventos de sync hacia Business Central.                           |
+| Worker                              | Trigger                                 | Qué hace                                                     |
+| ----------------------------------- | --------------------------------------- | ------------------------------------------------------------ |
+| `email-worker`                      | Inline o Kafka                          | Procesa los `EmailJob` (extracción, matching, persistencia). |
+| `graph-subscription-renewal.worker` | Interval cada `GRAPH_RENEW_INTERVAL_MS` | Renueva suscripciones de Graph antes del expiry.             |
+| `bc-sync-worker`                    | Polling DB                              | Despacha eventos de sync hacia Business Central.             |
 
 `SIGTERM`/`SIGINT` ⇒ se detienen los timers, se cierra Kafka y Prisma, y
 finalmente el HTTP server (timeout duro de 10 s).

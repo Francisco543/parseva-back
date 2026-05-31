@@ -28,6 +28,11 @@ model User {
   documents          DocumentRecord[]
   approvalsCreated   ApprovalRequest[]        @relation("ApprovalCreatedBy")
   approvalsDecided   ApprovalRequest[]        @relation("ApprovalDecidedBy")
+  approvalsAssigned  ApprovalRequest[]        @relation("ApprovalAssignee")
+  approvalRoutingRules ApprovalRoutingRule[] @relation("ApprovalRoutingAssignee")
+  documentNotes      DocumentNote[]
+  extractionFeedback ExtractionFieldFeedback[]
+  workspaceInvitesSent WorkspaceInvite[] @relation("WorkspaceInvitesSent")
 }
 
 model Workspace {
@@ -57,6 +62,35 @@ model Workspace {
   bcSyncEvents            BcSyncEvent[]
   documentEmbeddings      DocumentEmbedding[]
   documentLayouts         DocumentLayout[]
+  outgoingWebhooks        OutgoingWebhook[]
+  workspaceApiKeys        WorkspaceApiKey[]
+  workspaceInvites        WorkspaceInvite[]
+  approvalRoutingRules   ApprovalRoutingRule[]
+}
+
+/**
+ * Invitación por correo (mismo tenant Azure AD). Se acepta al primer login
+ * con Microsoft si el email coincide. Ver `workspace-invite.service.js`.
+ */
+model WorkspaceInvite {
+  id                String    @id @default(cuid())
+  workspaceId       String
+  /** Email normalizado en minúsculas (comparación con claims del id_token). */
+  email             String
+  role              String
+  status            String    @default("PENDING")
+  invitedByUserId   String?
+  expiresAt         DateTime?
+  acceptedAt        DateTime?
+  acceptedByUserId  String?
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  workspace  Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  invitedBy  User?     @relation("WorkspaceInvitesSent", fields: [invitedByUserId], references: [id], onDelete: SetNull)
+
+  @@index([workspaceId, status])
+  @@index([workspaceId, email])
 }
 
 model WorkspaceMembership {
@@ -145,6 +179,13 @@ model DocumentType {
   key         String
   displayName String
   enabled     Boolean @default(true)
+  /** Identificador del template base (catalogo Parseva BC). */
+  baseTemplateKey        String?
+  /** Version del template copiado al workspace. */
+  baseTemplateVersion    Int?
+  /** Marca de personalizacion manual para no sobreescribir en sync. */
+  isTemplateCustomized   Boolean  @default(false)
+  templateCustomizedAt   DateTime?
 
   /**
    * Plantilla de ruta por tipo (si null, se usa la del workspace).
@@ -180,9 +221,11 @@ model DocumentType {
   bcMappings        BusinessCentralMapping[]
   matchRules        MatchRule[]
   bcMappingProfiles BcMappingProfile[]
+  approvalRoutingRules ApprovalRoutingRule[]
 
   @@unique([workspaceId, key])
   @@index([workspaceId, enabled])
+  @@index([workspaceId, baseTemplateKey])
 }
 
 model DocumentRecord {
@@ -205,6 +248,8 @@ model DocumentRecord {
   status         String  @default("RECEIVED")
   confidence     Float?
   extractionJson Json?
+  /** Overrides manuales previos a ERP (lookups BC, correcciones planas por clave de extracción). */
+  bcStagingJson  Json?
   lastError      String?
 
   /**
@@ -215,6 +260,12 @@ model DocumentRecord {
   sharepointItemId  String?
   sharepointWebUrl  String?
   sharepointPath    String?
+
+  /** Integración usada al archivar (SharePoint, S3, Azure Blob, …). */
+  archiveIntegrationId String?
+  /** sharepoint | s3 | azure_blob — null en documentos legacy solo-SP. */
+  archiveStorageKind   String?
+  archiveStorageExtra  Json?
 
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
@@ -229,6 +280,8 @@ model DocumentRecord {
   bcSyncEvents     BcSyncEvent[]
   embeddingRow     DocumentEmbedding?
   layout           DocumentLayout?
+  documentNotes    DocumentNote[]
+  fieldFeedback    ExtractionFieldFeedback[]
 
   @@unique([workspaceId, sha256])
   @@index([workspaceId, status, createdAt])
@@ -285,11 +338,40 @@ model DocumentEmbedding {
   @@index([workspaceId])
 }
 
+/**
+ * Regla de enrutado de aprobación: primera coincidencia por `priority` asc gana.
+ * `conditionJson`: { op: "always" } | { op: "eq"|"in"|"contains_ci"|"gt"|"gte"|"lt"|"lte", field, value?|values? }
+ * Campo `field` debe existir en el esquema de extracción del tipo o en metadatos (`__confidence`).
+ */
+model ApprovalRoutingRule {
+  id               String   @id @default(cuid())
+  workspaceId      String
+  documentTypeId   String
+  priority         Int      @default(0)
+  conditionJson    Json
+  assigneeUserId   String
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  workspace    Workspace    @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+  documentType DocumentType @relation(fields: [documentTypeId], references: [id], onDelete: Cascade)
+  assignee     User         @relation("ApprovalRoutingAssignee", fields: [assigneeUserId], references: [id], onDelete: Cascade)
+
+  approvalRequests ApprovalRequest[]
+
+  @@index([workspaceId, documentTypeId, priority])
+}
+
 model ApprovalRequest {
   id          String  @id @default(cuid())
   workspaceId String?
   documentId  String
   status      String  @default("PENDING")
+
+  /** Usuario al que se asignó la aprobación pendiente (motor de reglas). */
+  assigneeUserId String?
+  /** Regla que resolvió el assignee (auditoría). */
+  routingRuleId  String?
 
   createdByUserId String?
   decidedByUserId String?
@@ -303,9 +385,12 @@ model ApprovalRequest {
 
   createdByUser User? @relation("ApprovalCreatedBy", fields: [createdByUserId], references: [id], onDelete: SetNull)
   decidedByUser User? @relation("ApprovalDecidedBy", fields: [decidedByUserId], references: [id], onDelete: SetNull)
+  assignee      User? @relation("ApprovalAssignee", fields: [assigneeUserId], references: [id], onDelete: SetNull)
+  routingRule   ApprovalRoutingRule? @relation(fields: [routingRuleId], references: [id], onDelete: SetNull)
 
   @@index([workspaceId, status, createdAt])
   @@index([documentId])
+  @@index([assigneeUserId, status])
 }
 
 model BusinessCentralMapping {
@@ -403,6 +488,10 @@ model BcField {
   dataType    String
   required    Boolean  @default(false)
   allowWrite  Boolean  @default(true)
+  /** text | number | date | lookup — UI Parseva */
+  uiHint    String?
+  /** Referencia de catálogo en BC (vendors, items, …) para GET /lookups */
+  lookupRef String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
@@ -420,6 +509,8 @@ model BcMappingProfile {
   bcTargetId     String
   name           String
   enabled        Boolean  @default(true)
+  /** Orden dentro del mismo tipo documental al armar operations[] (menor primero). */
+  syncOrder      Int      @default(0)
   fieldMap       Json
   transformMap   Json?
   createdAt      DateTime @default(now())
@@ -491,6 +582,11 @@ model InvoiceRecord {
   sharepointPath    String?
   fileName          String?
   lastError         String?
+
+  archiveIntegrationId String?
+  archiveStorageKind   String?
+  archiveStorageExtra  Json?
+
   createdAt         DateTime     @default(now())
   updatedAt         DateTime     @updatedAt
   user              User         @relation(fields: [userId], references: [id], onDelete: Cascade)
@@ -553,5 +649,61 @@ model AuditEvent {
   @@index([workspaceId, createdAt])
   @@index([userId, createdAt])
   @@index([action, createdAt])
+}
+
+model DocumentNote {
+  id         String   @id @default(cuid())
+  documentId String
+  userId     String
+  body       String   @db.Text
+  createdAt  DateTime @default(now())
+
+  document DocumentRecord @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  user     User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([documentId, createdAt])
+}
+
+model OutgoingWebhook {
+  id          String   @id @default(cuid())
+  workspaceId String
+  url         String
+  secret      String
+  events      Json     @default("[]")
+  enabled     Boolean  @default(true)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId, enabled])
+}
+
+model WorkspaceApiKey {
+  id          String   @id @default(cuid())
+  workspaceId String
+  name        String
+  keyPrefix   String
+  keyHash     String
+  createdAt   DateTime @default(now())
+
+  workspace Workspace @relation(fields: [workspaceId], references: [id], onDelete: Cascade)
+
+  @@index([workspaceId])
+}
+
+model ExtractionFieldFeedback {
+  id             String   @id @default(cuid())
+  documentId     String
+  userId         String
+  fieldKey       String
+  reportedValue  Json?
+  comment        String?
+  createdAt      DateTime @default(now())
+
+  document DocumentRecord @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  user     User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([documentId, createdAt])
 }
 

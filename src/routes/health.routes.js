@@ -8,10 +8,23 @@
  * @module routes/health
  */
 
+const path = require("node:path");
+const fs = require("node:fs");
+
 const express = require("express");
 const prisma = require("../lib/prisma");
 
 const router = express.Router();
+
+router.get("/openapi.json", (_req, res) => {
+  try {
+    const specPath = path.join(__dirname, "..", "openapi", "openapi.json");
+    const raw = fs.readFileSync(specPath, "utf8");
+    res.type("application/json").send(raw);
+  } catch {
+    res.status(404).json({ message: "Especificación OpenAPI no disponible" });
+  }
+});
 
 router.get("/health", async (_req, res) => {
   try {

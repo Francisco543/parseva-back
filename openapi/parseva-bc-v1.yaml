@@ -1,0 +1,265 @@
+openapi: 3.0.3
+info:
+  title: Parseva Business Central Connector API
+  version: 1.0.0
+  description: |
+    Contrato HTTP expuesto por la extensión AL `parseva-api-bc` (API Publisher).
+    Parseva agrega `operations[]` desde `BcMappingProfile` y datos fusionados
+    (extracción OCR + `bcStagingJson`).
+
+servers:
+  - url: https://api.businesscentral.dynamics.com/v2.0/{tenant}/{environment}/api/parseva/parseva/v1.0/companies({company})
+    variables:
+      tenant:
+        default: tenant-guid
+      environment:
+        default: sandbox
+      company:
+        default: company-guid
+
+tags:
+  - name: metadata
+  - name: lookups
+  - name: ingest
+
+paths:
+  /targets:
+    get:
+      tags: [metadata]
+      summary: Metadatos de destinos BC registrados
+      operationId: getTargets
+      responses:
+        "200":
+          description: Lista de destinos con campos y relaciones
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TargetsResponse"
+
+  /lookups/{lookupRef}:
+    get:
+      tags: [lookups]
+      summary: Búsqueda paginada de opciones para un lookup
+      operationId: searchLookup
+      parameters:
+        - name: lookupRef
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: q
+          in: query
+          schema:
+            type: string
+          description: Texto de búsqueda (filtro server-side)
+        - name: top
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+      responses:
+        "200":
+          description: Resultados
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LookupSearchResponse"
+
+  /ingest:
+    post:
+      tags: [ingest]
+      summary: Ingesta universal multi-operación
+      operationId: postIngest
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+        - name: X-Parseva-Workspace-Id
+          in: header
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/IngestRequest"
+      responses:
+        "200":
+          description: Aceptado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestResponse"
+        "201":
+          description: Creado
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IngestResponse"
+        "400":
+          description: Validación / payload inválido
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorBody"
+        "409":
+          description: Conflicto de idempotencia o estado BC
+
+components:
+  schemas:
+    TargetsResponse:
+      type: object
+      required: [targets]
+      properties:
+        targets:
+          type: array
+          items:
+            $ref: "#/components/schemas/TargetDescriptor"
+
+    TargetDescriptor:
+      type: object
+      required: [targetKey, displayName, fields]
+      properties:
+        targetKey:
+          type: string
+        displayName:
+          type: string
+        category:
+          type: string
+          nullable: true
+        fields:
+          type: array
+          items:
+            $ref: "#/components/schemas/FieldDescriptor"
+
+    FieldDescriptor:
+      type: object
+      required: [key, label, dataType, required]
+      properties:
+        key:
+          type: string
+        label:
+          type: string
+        dataType:
+          type: string
+        required:
+          type: boolean
+        uiHint:
+          type: string
+          enum: [text, number, date, lookup]
+        lookupRef:
+          type: string
+          nullable: true
+        dependsOn:
+          type: array
+          items:
+            type: string
+        relation:
+          type: object
+          nullable: true
+          properties:
+            kind:
+              type: string
+              enum: [lookup, lines]
+            toTargetKey:
+              type: string
+            cardinality:
+              type: string
+
+    LookupSearchResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/LookupItem"
+
+    LookupItem:
+      type: object
+      required: [id, display]
+      properties:
+        id:
+          description: Valor enviado en ingest (ej. Nº proveedor)
+          type: string
+        display:
+          type: string
+        subtitle:
+          type: string
+        raw:
+          type: object
+          additionalProperties: true
+
+    IngestRequest:
+      type: object
+      required: [documentId, idempotencyKey, operations]
+      properties:
+        documentId:
+          type: string
+        idempotencyKey:
+          type: string
+        operations:
+          type: array
+          items:
+            $ref: "#/components/schemas/IngestOperation"
+
+    IngestOperation:
+      type: object
+      required: [targetKey, mode]
+      properties:
+        targetKey:
+          type: string
+        mode:
+          type: string
+          enum: [insert, upsert, update]
+        matchKeys:
+          type: object
+          additionalProperties: true
+        fields:
+          type: object
+          additionalProperties: true
+        parentRef:
+          type: object
+          properties:
+            opIndex:
+              type: integer
+        lines:
+          type: array
+          items:
+            type: object
+            required: [fields]
+            properties:
+              fields:
+                type: object
+                additionalProperties: true
+
+    IngestResponse:
+      type: object
+      required: [accepted]
+      properties:
+        accepted:
+          type: boolean
+        externalRefs:
+          type: array
+          items:
+            type: string
+        warnings:
+          type: array
+          items:
+            type: string
+
+    ErrorBody:
+      type: object
+      properties:
+        code:
+          type: string
+        message:
+          type: string
+        field:
+          type: string
+        operationIndex:
+          type: integer

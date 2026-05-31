@@ -20,6 +20,9 @@ const invoiceRoutes = require("./invoice.routes");
 const auditRoutes = require("./audit.routes");
 const documentRoutes = require("./document.routes");
 const studioRoutes = require("./studio.routes");
+const workspaceMembersRoutes = require("./workspace-members.routes");
+const workspaceInvitesRoutes = require("./workspace-invites.routes");
+const approvalRoutingRoutes = require("./approval-routing.routes");
 const { authenticateSession } = require("../middlewares/session-auth.middleware");
 
 const router = express.Router();
@@ -35,6 +38,9 @@ router.use("/api", invoiceRoutes);
 router.use("/api", auditRoutes);
 router.use("/api", documentRoutes);
 router.use("/api", studioRoutes);
+router.use("/api", workspaceMembersRoutes);
+router.use("/api", workspaceInvitesRoutes);
+router.use("/api", approvalRoutingRoutes);
 
 router.get("/api/protected", authenticateSession, (req, res) => {
   res.json({

@@ -25,6 +25,8 @@ const {
   listWorkspacesForUser,
   getMembership,
 } = require("../services/workspace.service");
+const { createAuditEvent } = require("../services/audit.service");
+const { AUDIT_ACTION } = require("../constants/audit-actions");
 const { createPkceCodes } = require("../utils/pkce");
 const {
   getCookieOptions,
@@ -32,6 +34,8 @@ const {
   readAuthFlow,
   signSession,
 } = require("../lib/session");
+const { requireWorkspaceContext } = require("../middlewares/workspace-context.middleware");
+const { listPermissionsForRole, normalizeRole } = require("../constants/rbac");
 
 const router = express.Router();
 
@@ -111,12 +115,27 @@ router.get("/auth/callback", async (req, res, next) => {
     }
 
     const dbUser = await upsertUserFromToken(normalizedClaims);
-    const { workspace, membership } = await ensureWorkspaceForUser({
+    const loginEmail =
+      normalizedClaims.preferred_username || normalizedClaims.email || "";
+    const { workspace, membership, acceptedInviteId } = await ensureWorkspaceForUser({
       userId: dbUser.id,
       tid: normalizedClaims.tid,
       fallbackName:
         normalizedClaims.preferred_username?.split("@")[1] || normalizedClaims.tid,
+      loginEmail,
     });
+    if (acceptedInviteId) {
+      await createAuditEvent({
+        action: AUDIT_ACTION.WORKSPACE_INVITE_ACCEPTED,
+        userId: dbUser.id,
+        workspaceId: workspace.id,
+        entityType: "WorkspaceInvite",
+        entityId: acceptedInviteId,
+        metadata: { email: loginEmail, membershipRole: membership.role },
+        ip: req.ip,
+        userAgent: req.headers["user-agent"],
+      });
+    }
     const sessionToken = signSession(
       buildSessionPayload(dbUser, normalizedClaims, workspace, membership)
     );
@@ -133,14 +152,26 @@ router.get("/auth/callback", async (req, res, next) => {
   }
 });
 
-router.get("/auth/session", authenticateSession, (req, res) => {
-  res.json({
-    authenticated: true,
-    user: req.user,
-    dbUser: req.dbUser,
-    workspace: req.workspace,
-  });
-});
+router.get(
+  "/auth/session",
+  authenticateSession,
+  requireWorkspaceContext,
+  (req, res) => {
+    const rawRole = req.workspaceMembership.role;
+    res.json({
+      authenticated: true,
+      user: req.user,
+      dbUser: req.dbUser,
+      workspace: {
+        id: req.workspace.id,
+        name: req.workspace.name,
+        role: normalizeRole(rawRole),
+        roleRaw: rawRole,
+        permissions: listPermissionsForRole(rawRole),
+      },
+    });
+  }
+);
 
 router.get("/workspaces", authenticateSession, async (req, res, next) => {
   try {
